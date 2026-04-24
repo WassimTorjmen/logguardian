@@ -1,0 +1,41 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_ACCOUNT_ID: "148761640356"
+    AWS_DEFAULT_REGION: "eu-west-1"
+    IMAGE_REPO_PREFIX: "logguardian"
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+  build:
+    commands:
+      - echo Building only services with a Dockerfile...
+      - |
+        for service in log-generator etl-processor ml-model monitoring-ui; do
+          if [ -f "$service/Dockerfile" ]; then
+            echo "Building $service..."
+            docker build -t $IMAGE_REPO_PREFIX/$service:$IMAGE_TAG ./$service
+            docker tag $IMAGE_REPO_PREFIX/$service:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX/$service:$IMAGE_TAG
+          else
+            echo "Skipping $service (no Dockerfile)"
+          fi
+        done
+
+  post_build:
+    commands:
+      - echo Pushing images to ECR...
+      - |
+        for service in log-generator etl-processor ml-model monitoring-ui; do
+          if [ -f "$service/Dockerfile" ]; then
+            echo "Pushing $service..."
+            docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX/$service:$IMAGE_TAG
+          fi
+        done
+      - echo Build completed on $(date)
