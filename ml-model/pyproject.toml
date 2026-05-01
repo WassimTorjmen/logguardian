@@ -1,0 +1,26 @@
+[project]
+name = "logguardian-ml-model"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scikit-learn",
+    "kafka-python",
+    "boto3",
+    "python-dotenv",
+    "matplotlib",
+    "seaborn",
+    "nbconvert",
+    "jupyter",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,8 @@
+torch
+numpy
+pandas
+pyarrow
+scikit-learn
+kafka-python
+boto3
+python-dotenv
