@@ -1,54 +1,49 @@
 # LogGuardian
 
-Plateforme de détection d'anomalies dans les logs système par intelligence artificielle.
+Détection d'anomalies dans les logs système par intelligence artificielle.
 
-## Ce que ça fait
-
-LogGuardian lit des logs en temps réel, les analyse avec un modèle LSTM, et détecte les comportements anormaux automatiquement.
+## Pipeline
 
 ```
-logs bruts → Kafka → ETL → Kafka → LSTM → alertes
+log-generator → logs-raw → etl-processor → logs-processed → ml-model → logs-anomalies-ml
 ```
 
-## Lancer le projet
+Chaque étape communique via Kafka. Le monitoring UI consomme `logs-anomalies-ml` et affiche les alertes en temps réel.
+
+## Lancer
 
 ```bash
 docker compose up -d
 ```
 
-Ouvrir l'interface Kafka sur http://localhost:8080 pour voir les messages en temps réel.
+| Interface | URL |
+|---|---|
+| Monitoring UI | http://localhost:8050 |
+| Kafka UI | http://localhost:8080 |
 
-## Les services
+## Services
 
 | Service | Rôle |
 |---|---|
-| log-generator | Rejoue des vrais fichiers de logs dans Kafka |
-| etl-processor | Nettoie les logs, détecte les erreurs évidentes (ERROR/FATAL) |
-| ml-model | Détecte les anomalies sémantiques avec le modèle LSTM |
-| kafka | Bus de communication entre tous les services |
+| `log-generator` | Rejoue de vrais fichiers de logs dans Kafka |
+| `etl-processor` | Nettoie et vectorise les logs, détecte les anomalies évidentes (ERROR/FATAL) |
+| `ml-model` | Détecte les anomalies sémantiques avec un LSTM Autoencoder |
+| `monitoring-ui` | Dashboard temps réel des anomalies détectées |
 
-## Le modèle LSTM
+## Modèle LSTM
 
-Le modèle est entraîné uniquement sur des logs normaux. Quand il voit une séquence anormale, il n'arrive pas à la reconstruire correctement — c'est ce signal d'erreur qui déclenche l'alerte.
+Entraîné uniquement sur des logs normaux. Une séquence est anormale quand le modèle n'arrive pas à la reconstruire — l'erreur de reconstruction (MSE) devient le score d'anomalie.
 
-- **Entrée** : fenêtre glissante de 10 logs
-- **Seuil** : 1.307 (percentile 95 sur les données de validation)
-- **Résultat** : score MSE > seuil → anomalie publiée dans `logs-anomalies-ml`
-
-## Déploiement AWS
-
-Les manifests Kubernetes sont dans `k8s/`. Le cluster EKS `logguardian` tourne sur `eu-west-1`.
-
-```bash
-kubectl apply -f k8s/
-```
+- Entrée : fenêtre glissante de 10 logs (vecteur 77 dims)
+- Seuil : 1.307 (percentile 95 sur validation)
+- Score > seuil → anomalie publiée dans `logs-anomalies-ml`
 
 ## Structure
 
 ```
-log-generator/   générateur de logs
-etl-processor/   traitement ETL
-ml-model/        modèle LSTM (entraînement + inférence)
-k8s/             manifests Kubernetes
-data/            datasets LogHub
+log-generator/    générateur de logs
+etl-processor/    traitement ETL
+ml-model/         modèle LSTM (entraînement + inférence)
+monitoring-ui/    dashboard Dash
+data/             datasets LogHub
 ```

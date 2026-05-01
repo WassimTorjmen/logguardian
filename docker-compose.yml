@@ -104,5 +104,18 @@ services:
       DEVICE: cpu
     restart: on-failure
 
+  monitoring-ui:
+    build:
+      context: ./monitoring-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8050:8050"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: logs-anomalies-ml
+    restart: on-failure
+
 volumes:
   etl-output:
