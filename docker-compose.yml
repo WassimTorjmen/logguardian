@@ -85,5 +85,24 @@ services:
       LOCAL_OUTPUT_DIR: /tmp/etl-output
     restart: on-failure
 
+  ml-model:
+    build:
+      context: ./ml-model
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./ml-model/models:/app/models:ro
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_INPUT_TOPIC: logs-processed
+      KAFKA_OUTPUT_TOPIC: logs-anomalies-ml
+      KAFKA_GROUP_ID: ml-model
+      MODEL_DIR: /app/models
+      LOCAL_MODEL_MODE: "true"
+      SEQUENCE_LENGTH: "10"
+      DEVICE: cpu
+    restart: on-failure
+
 volumes:
   etl-output:
