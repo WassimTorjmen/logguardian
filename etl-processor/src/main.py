@@ -1,9 +1,10 @@
 import logging
 
 from config import (
-    AWS_REGION,
     BATCH_SIZE,
     BATCH_TIMEOUT_SEC,
+    GCS_BUCKET,
+    GCS_PREFIX,
     KAFKA_ANOMALY_TOPIC,
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_GROUP_ID,
@@ -11,12 +12,10 @@ from config import (
     KAFKA_OUTPUT_TOPIC,
     LOCAL_MODE,
     LOCAL_OUTPUT_DIR,
-    S3_BUCKET,
-    S3_PREFIX,
 )
 from consumer import consume_batch, make_consumer
 from producer import make_producer, publish_anomalies, publish_processed
-from s3_loader import load_to_local, load_to_s3
+from gcs_loader import load_to_gcs, load_to_local
 from transformer import transform_batch
 
 logging.basicConfig(
@@ -31,7 +30,7 @@ def main():
     log.info("  Input     : %s -> %s", KAFKA_BOOTSTRAP_SERVERS, KAFKA_INPUT_TOPIC)
     log.info("  Processed : %s -> %s", KAFKA_BOOTSTRAP_SERVERS, KAFKA_OUTPUT_TOPIC)
     log.info("  Anomalies : %s -> %s", KAFKA_BOOTSTRAP_SERVERS, KAFKA_ANOMALY_TOPIC)
-    log.info("  Storage   : %s", "LOCAL:" + LOCAL_OUTPUT_DIR if LOCAL_MODE else "S3:" + S3_BUCKET)
+    log.info("  Storage   : %s", "LOCAL:" + LOCAL_OUTPUT_DIR if LOCAL_MODE else "GCS:" + GCS_BUCKET)
     log.info("  Batch     : %d messages or %ds timeout", BATCH_SIZE, BATCH_TIMEOUT_SEC)
 
     kafka_consumer = make_consumer(KAFKA_BOOTSTRAP_SERVERS, KAFKA_INPUT_TOPIC, KAFKA_GROUP_ID)
@@ -62,7 +61,7 @@ def main():
         if LOCAL_MODE:
             files = load_to_local(df, LOCAL_OUTPUT_DIR)
         else:
-            files = load_to_s3(df, S3_BUCKET, S3_PREFIX, AWS_REGION)
+            files = load_to_gcs(df, GCS_BUCKET, GCS_PREFIX)
 
         # --- Publish : tous les logs enrichis -> logs-processed ---
         sent_processed = publish_processed(kafka_producer, df, KAFKA_OUTPUT_TOPIC)

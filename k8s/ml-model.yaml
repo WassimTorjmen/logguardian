@@ -4,7 +4,7 @@ metadata:
   name: ml-model
   namespace: logguardian
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::148761640356:role/LogGuardianMLModelRole
+    iam.gke.io/gcp-service-account: terraform-sa@logguardian-497218.iam.gserviceaccount.com
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -16,8 +16,7 @@ data:
   KAFKA_INPUT_TOPIC: logs-processed
   KAFKA_OUTPUT_TOPIC: logs-anomalies-ml
   KAFKA_GROUP_ID: ml-model
-  S3_MODELS_BUCKET: logguardian-models-148761640356
-  AWS_REGION: eu-west-1
+  GCS_MODELS_BUCKET: logguardian-models-logguardian-497218
   LOCAL_MODEL_MODE: "false"
   MODEL_DIR: /app/models
   SEQUENCE_LENGTH: "10"
@@ -44,7 +43,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: ml-model
-          image: 148761640356.dkr.ecr.eu-west-1.amazonaws.com/logguardian/ml-model:latest
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/ml-model:latest
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
