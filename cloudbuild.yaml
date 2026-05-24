@@ -1,0 +1,22 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        for service in log-generator etl-processor ml-model monitoring-ui; do
+          if [ -f "$service/Dockerfile" ]; then
+            echo "Building $service..."
+            docker build -t europe-west1-docker.pkg.dev/$PROJECT_ID/logguardian/$service:$SHORT_SHA ./$service
+            docker push europe-west1-docker.pkg.dev/$PROJECT_ID/logguardian/$service:$SHORT_SHA
+            echo "Done $service"
+          else
+            echo "Skipping $service (no Dockerfile)"
+          fi
+        done
+
+substitutions:
+  _REGION: europe-west1
+
+options:
+  logging: CLOUD_LOGGING_ONLY
