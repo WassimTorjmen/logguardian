@@ -42,7 +42,7 @@ spec:
       serviceAccountName: etl-processor
       containers:
         - name: etl-processor
-          image: 148761640356.dkr.ecr.eu-west-1.amazonaws.com/logguardian/etl-processor:latest
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/etl-processor:aef6afe
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
