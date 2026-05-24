@@ -1,5 +1,7 @@
 steps:
+  # Étape 1 : Build + Push des images modifiées
   - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-and-push'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -14,6 +16,26 @@ steps:
             echo "Skipping $service (no Dockerfile)"
           fi
         done
+
+  # Étape 2 : Mise à jour des deployments GKE avec le nouveau tag
+  - name: 'gcr.io/cloud-builders/kubectl'
+    id: 'deploy-to-gke'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        for service in log-generator etl-processor ml-model monitoring-ui; do
+          if [ -f "$service/Dockerfile" ]; then
+            echo "Updating deployment/$service on GKE..."
+            kubectl set image deployment/$service \
+              $service=europe-west1-docker.pkg.dev/$PROJECT_ID/logguardian/$service:$SHORT_SHA \
+              -n logguardian || echo "Deployment $service not found, skipping"
+          fi
+        done
+    env:
+      - 'CLOUDSDK_COMPUTE_ZONE=europe-west1-b'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=logguardian'
+      - 'CLOUDSDK_CORE_PROJECT=$PROJECT_ID'
 
 substitutions:
   _REGION: europe-west1
