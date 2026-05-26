@@ -1,0 +1,25 @@
+{
+  "displayName": "LogGuardian - Pod CrashLoop",
+  "conditions": [
+    {
+      "displayName": "Pod restart count > 3 in 5 min",
+      "conditionThreshold": {
+        "filter": "resource.type=\"k8s_container\" AND resource.labels.namespace_name=\"logguardian\" AND metric.type=\"kubernetes.io/container/restart_count\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 3,
+        "duration": "0s"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "604800s"
+  },
+  "combiner": "OR",
+  "enabled": true
+}

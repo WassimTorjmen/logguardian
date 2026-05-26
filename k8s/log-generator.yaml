@@ -28,7 +28,7 @@ metadata:
 data:
   KAFKA_BOOTSTRAP_SERVERS: kafka.logguardian.svc.cluster.local:29092
   KAFKA_TOPIC: logs-raw
-  REPLAY_SPEED: "100"
+  REPLAY_SPEED: "50"
   DATA_DIR: /data
   LOG_SOURCES: linux,ssh,hadoop,supercomputer,android,spark
   DATA_S3_URI: gs://logguardian-datalake-logguardian-497218/raw-logs/
@@ -41,6 +41,8 @@ metadata:
   namespace: logguardian
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: log-generator
