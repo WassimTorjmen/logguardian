@@ -104,7 +104,13 @@ spec:
             - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
               value: "true"
             - name: KAFKA_LOG_RETENTION_HOURS
-              value: "24"
+              value: "1"
+            - name: KAFKA_LOG_RETENTION_BYTES
+              value: "536870912"
+            - name: KAFKA_LOG_SEGMENT_BYTES
+              value: "134217728"
+            - name: KAFKA_LOG_CLEANUP_POLICY
+              value: "delete"
           readinessProbe:
             tcpSocket:
               port: 29092

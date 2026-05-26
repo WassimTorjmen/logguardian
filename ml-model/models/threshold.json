@@ -1,6 +1,6 @@
 {
-  "threshold": 1.3071832656860352,
-  "percentile": 95,
+  "threshold": 0.5,
+  "percentile": 50,
   "computed_at": "2026-05-01T14:43:59.492389+00:00",
   "n_samples": 4371,
   "n_features": 77,
