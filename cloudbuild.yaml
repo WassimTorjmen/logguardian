@@ -17,13 +17,16 @@ steps:
           fi
         done
 
-  # Étape 2 : Mise à jour des deployments GKE avec le nouveau tag
-  - name: 'gcr.io/cloud-builders/kubectl'
+  # Étape 2 : Authentification GKE + Mise à jour des deployments
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     id: 'deploy-to-gke'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
+        gcloud container clusters get-credentials logguardian \
+          --zone=europe-west1-b \
+          --project=$PROJECT_ID
         for service in log-generator etl-processor ml-model monitoring-ui; do
           if [ -f "$service/Dockerfile" ]; then
             echo "Updating deployment/$service on GKE..."
@@ -32,10 +35,6 @@ steps:
               -n logguardian || echo "Deployment $service not found, skipping"
           fi
         done
-    env:
-      - 'CLOUDSDK_COMPUTE_ZONE=europe-west1-b'
-      - 'CLOUDSDK_CONTAINER_CLUSTER=logguardian'
-      - 'CLOUDSDK_CORE_PROJECT=$PROJECT_ID'
 
 substitutions:
   _REGION: europe-west1
