@@ -30,12 +30,26 @@ def _handle_signal(signum, frame):
     _shutdown = True
 
 
+def _roundrobin(*iterables):
+    """Yield one item from each iterable in turn, skipping exhausted ones."""
+    pending = [iter(it) for it in iterables]
+    while pending:
+        next_pending = []
+        for it in pending:
+            try:
+                yield next(it)
+                next_pending.append(it)
+            except StopIteration:
+                pass
+        pending = next_pending
+
+
 def build_stream(data_dir: str, sources: list):
     parsers = [ALL_PARSERS[s]() for s in sources if s in ALL_PARSERS]
     if not parsers:
         raise ValueError(f"No valid sources in {sources}")
     generators = [p.parse(data_dir) for p in parsers]
-    return itertools.chain.from_iterable(generators)
+    return _roundrobin(*generators)
 
 
 def main():
