@@ -115,7 +115,32 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: logs-anomalies-ml
+      MAX_ROWS: 2000
+      REFRESH_INTERVAL_MS: 3000
+      ALERT_THRESHOLD: 1.3
+      EMAIL_ALERTS_ENABLED: "false" #Set to "true" to enable email alerts
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: 587
+      SMTP_USER: eya796067@gmail.com
+      SMTP_PASSWORD: "ksjl uvxs jxuw rinb"
+      MAIL_TO: eya796067@gmail.com
+    volumes:
+      - ./feedback:/app/feedback
     restart: on-failure
+  
+  monitoring-ui-streamlit:
+    build: ./monitoring-ui-streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: logs-anomalies-ml
+      MAX_ROWS: 2000
+      ALERT_THRESHOLD: 2.0
+      REFRESH_SECONDS: 3
+    depends_on:
+      kafka:
+        condition: service_healthy
 
 volumes:
   etl-output:
