@@ -1,35 +1,209 @@
 """
-LogGuardian — AIOps Platform UI  (multi-pages : Dashboard / Logs / Alertes)
+LogGuardian — AIOps Command Center UI
+Radical Dash redesign: static pages, stable callbacks, logs table, RAG explanation + recommendation + feedback.
 """
-import json, logging, os, threading, random
-from collections import deque
-from datetime import datetime, timedelta
+import json
+import logging
+import os
+import random
+import threading
+from collections import Counter, deque
+from datetime import datetime
 
 import dash
 from dash import dash_table, dcc, html, callback_context
 from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 from confluent_kafka import Consumer
 
+import smtplib
+from email.mime.text import MIMEText
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("monitoring-ui")
+log = logging.getLogger("logguardian-ui")
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC             = os.getenv("KAFKA_TOPIC", "logs-anomalies-ml")
-MAX_ROWS                = int(os.getenv("MAX_ROWS", "2000"))
-REFRESH_INTERVAL_MS     = int(os.getenv("REFRESH_INTERVAL_MS", "3000"))
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "logs-anomalies-ml")
+MAX_ROWS = int(os.getenv("MAX_ROWS", "2000"))
+REFRESH_INTERVAL_MS = int(os.getenv("REFRESH_INTERVAL_MS", "3000"))
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "2.0"))
+FEEDBACK_PATH = os.getenv("FEEDBACK_PATH", "/app/feedback/rag_feedback.jsonl")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+MAIL_TO = os.getenv("MAIL_TO", "")
+EMAIL_ALERTS_ENABLED = os.getenv("EMAIL_ALERTS_ENABLED", "false").lower() == "true"
 
 _buffer: deque = deque(maxlen=MAX_ROWS)
 _lock = threading.Lock()
 _total_received = 0
+_email_cache = set()
+_email_lock = threading.Lock()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THEME — light, clean, monitoring grid inspired by Postgres/Grafana panels
+# ─────────────────────────────────────────────────────────────────────────────
+T = {
+    "bg": "#f3f6fb",
+    "paper": "#ffffff",
+    "paper2": "#f8fafc",
+    "sidebar": "#0f172a",
+    "sidebar2": "#111c33",
+    "border": "#d8e0ec",
+    "border2": "#edf1f7",
+    "text": "#111827",
+    "muted": "#667085",
+    "muted2": "#94a3b8",
+    "blue": "#2563eb",
+    "cyan": "#0891b2",
+    "green": "#16a34a",
+    "red": "#dc2626",
+    "orange": "#f97316",
+    "purple": "#7c3aed",
+    "yellow": "#eab308",
+    "black": "#020617",
+}
+
+TABLE_COLS = ["Timestamp", "Source", "Host", "Message", "Score IA", "Ratio", "Statut"]
+ALERT_COLS = ["Timestamp", "Source", "Host", "Message", "Score IA", "Ratio", "Model"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KAFKA THREAD
+# ─────────────────────────────────────────────────────────────────────────────
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _extract_message(r):
+    seq = r.get("sequence") or []
+    if isinstance(seq, list) and seq:
+        last = seq[-1]
+        if isinstance(last, dict):
+            return str(last.get("message", ""))[:240]
+        return str(last)[:240]
+    return str(r.get("message", ""))[:240]
+
+
+def _build_row(r):
+    detected = str(r.get("detected_at", ""))
+    score = _safe_float(r.get("anomaly_score", 0))
+    ratio = _safe_float(r.get("severity_ratio", 0))
+    threshold = _safe_float(r.get("threshold", ALERT_THRESHOLD))
+    status = "ANOMALIE" if ratio > ALERT_THRESHOLD else "NORMAL"
+    return {
+        "id": f"{detected}_{random.randint(0, 999999)}",
+        "Timestamp": detected[:19].replace("T", " "),
+        "Source": str(r.get("source", "unknown")),
+        "Host": str(r.get("host", "unknown")),
+        "Message": _extract_message(r),
+        "Score IA": f"{score:.2f}",
+        "Ratio": f"{ratio:.2f}x",
+        "Model": str(r.get("model_version", "lstm_v1")),
+        "Statut": status,
+        "_score_val": score,
+        "_ratio_val": ratio,
+        "_threshold_val": threshold,
+        "_raw": r,
+    }
+
+
+
+def _parse_security_context(row):
+    import re
+    message = row.get("Message", "")
+    ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", message)
+    user_match = re.search(r"user=([a-zA-Z0-9_.-]+)", message)
+    return {
+        "ip": ip_match.group(0) if ip_match else "non détectée",
+        "user": user_match.group(1) if user_match else "non détecté",
+    }
+
+
+def _email_recommendation(row):
+    msg = row.get("Message", "").lower()
+    if "authentication" in msg or "ssh" in msg or "kerberos" in msg:
+        return "Vérifier les authentifications récentes, identifier l'IP source et bloquer l'accès si nécessaire."
+    if "timeout" in msg or "connection" in msg:
+        return "Vérifier la connectivité réseau, la disponibilité du service et les timeouts applicatifs."
+    if "error" in msg or "failed" in msg:
+        return "Inspecter le service concerné, corréler avec les logs voisins et redémarrer si l'erreur se répète."
+    return "Analyser le service concerné, corréler avec les logs voisins et vérifier l'état de l'hôte."
+
+
+def _send_email_alert(row):
+    if not EMAIL_ALERTS_ENABLED:
+        return
+    if not SMTP_USER or not SMTP_PASSWORD or not MAIL_TO:
+        log.warning("Email alert skipped — SMTP config incomplete.")
+        return
+
+    ctx = _parse_security_context(row)
+    subject = f"[LogGuardian] Incident détecté - {row.get('Source','unknown')} / {row.get('Host','unknown')}"
+    body = f"""Bonjour,
+
+Un incident a été détecté par LogGuardian.
+
+Timestamp : {row.get('Timestamp', '—')}
+Source    : {row.get('Source', '—')}
+Host      : {row.get('Host', '—')}
+Statut    : {row.get('Statut', '—')}
+Score IA  : {row.get('Score IA', '—')}
+Ratio     : {row.get('Ratio', '—')}
+Modèle    : {row.get('Model', '—')}
+
+Log détecté :
+{row.get('Message', '—')}
+
+Parsing automatique :
+IP détectée          : {ctx['ip']}
+Utilisateur détecté : {ctx['user']}
+
+Recommandation :
+{_email_recommendation(row)}
+
+LogGuardian — AIOps Command Center
+"""
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = MAIL_TO
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+
+    log.info("Email alert sent — source=%s host=%s ratio=%s", row.get("Source"), row.get("Host"), row.get("Ratio"))
+
+
+def _maybe_send_email_alert(row):
+    if row.get("Statut") != "ANOMALIE":
+        return
+    incident_key = f"{row.get('Timestamp')}|{row.get('Host')}|{row.get('Message')}"
+    with _email_lock:
+        if incident_key in _email_cache:
+            return
+        _email_cache.add(incident_key)
+    threading.Thread(target=_send_email_alert, args=(row,), daemon=True).start()
+
 
 
 def _kafka_thread():
-    log.info("Thread Kafka démarré — connexion à %s", KAFKA_BOOTSTRAP_SERVERS)
+    global _total_received
+    log.info("Kafka consumer start — broker=%s topic=%s", KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC)
     consumer = Consumer({
-        "bootstrap.servers":  KAFKA_BOOTSTRAP_SERVERS,
-        "group.id":           "monitoring-ui",
-        "auto.offset.reset":  "latest",
+        "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
+        "group.id": f"monitoring-ui-{random.randint(0, 999999)}",
+        "auto.offset.reset": "earliest",
         "enable.auto.commit": True,
     })
     consumer.subscribe([KAFKA_TOPIC])
@@ -38,1198 +212,663 @@ def _kafka_thread():
         if msg is None:
             continue
         if msg.error():
-            log.warning("Erreur Kafka : %s", msg.error())
+            log.warning("Kafka error: %s", msg.error())
             continue
         try:
-            global _total_received
-            r = json.loads(msg.value().decode("utf-8"))
-            row = {
-                "Timestamp":  r.get("detected_at", "")[:19].replace("T", " "),
-                "Source":     r.get("source", ""),
-                "Host":       r.get("host", ""),
-                "Message":    r.get("sequence", [{}])[-1].get("message", "")[:120],
-                "Score IA":   f"{r.get('anomaly_score', 0):.2f}",
-                "Ratio":      f"{r.get('severity_ratio', 0):.2f}x",
-                "Statut":     "ANOMALIE" if r.get("severity_ratio", 0) > 1.3 else "NORMAL",
-                "_ratio_val": r.get("severity_ratio", 0),
-                "_score_val": r.get("anomaly_score", 0),
-                "_ts":        r.get("detected_at", ""),
-            }
+            payload = json.loads(msg.value().decode("utf-8"))
+            row = _build_row(payload)
             with _lock:
                 _buffer.appendleft(row)
                 _total_received += 1
+
+            _maybe_send_email_alert(row)
         except Exception as e:
-            log.error("Erreur parsing message : %s", e)
+            log.exception("Message parsing error: %s", e)
 
 
 threading.Thread(target=_kafka_thread, daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────────────────────
-app = dash.Dash(
-    __name__,
-    title="LogGuardian — AIOps Platform",
-    suppress_callback_exceptions=True,
-)
-app.server.config["SECRET_KEY"] = "logguardian"
+# APP
+# ─────────────────────────────────────────────────────────────────────────────
+app = dash.Dash(__name__, title="LogGuardian — Command Center", suppress_callback_exceptions=True)
+app.server.config["SECRET_KEY"] = "logguardian-command-center"
 
-app.index_string = '''<!DOCTYPE html>
+app.index_string = """<!DOCTYPE html>
 <html>
 <head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; background: #0b0d14; overflow: hidden; }
-  ::-webkit-scrollbar { width: 4px; height: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #2a2f45; border-radius: 2px; }
-
-  /* Dropdown */
-  .Select-control { background: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; color: #c8d0e7 !important; min-height: 36px !important; height: 36px !important; }
-  .Select-control:hover { border-color: #6366f1 !important; }
-  .Select-value-label { color: #c8d0e7 !important; line-height: 34px !important; }
-  .Select-placeholder { color: #4a6fa5 !important; line-height: 34px !important; }
-  .Select-arrow { border-top-color: #3b82f6 !important; }
-  .Select-menu-outer { background: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; }
-  .VirtualizedSelectOption { background: #0e1428 !important; color: #c8d0e7 !important; font-size: 12px !important; }
-  .VirtualizedSelectFocusedOption { background: #1a2a50 !important; color: #fff !important; }
-  .Select-input input { color: #c8d0e7 !important; }
-  /* Dropdown modern Dash */
-  .dash-dropdown .Select-control, .dash-dropdown > div > div { background-color: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; }
-  .dash-dropdown .Select__control { background-color: #0e1428 !important; border-color: #3b82f6 !important; border-radius: 6px !important; min-height: 36px !important; }
-  .dash-dropdown .Select__control:hover { border-color: #6366f1 !important; }
-  .dash-dropdown .Select__single-value, .dash-dropdown .Select__placeholder { color: #c8d0e7 !important; }
-  .dash-dropdown .Select__placeholder { color: #4a6fa5 !important; }
-  .dash-dropdown .Select__menu { background-color: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; }
-  .dash-dropdown .Select__option { background-color: #0e1428 !important; color: #c8d0e7 !important; }
-  .dash-dropdown .Select__option--is-focused { background-color: #1a2a50 !important; color: #fff !important; }
-  .dash-dropdown .Select__dropdown-indicator svg, .dash-dropdown .Select__indicator svg { color: #3b82f6 !important; }
-  .dash-dropdown .Select__input input, .dash-dropdown input { color: #c8d0e7 !important; background: transparent !important; }
-
-  /* Plotly */
-  .js-plotly-plot .plotly .modebar { background: transparent !important; }
-  .js-plotly-plot .plotly .modebar-btn path { fill: #4a5270 !important; }
-
-  @keyframes pulse-dot { 0%,100% { opacity:1; } 50% { opacity:.4; } }
-  .live-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
-  @keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(239,68,68,.4); } 70% { box-shadow: 0 0 0 8px rgba(239,68,68,0); } 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); } }
-  .alert-pulse { animation: pulse-ring 2s ease-out infinite; }
-
-  .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr:hover td { background-color: #1a1f35 !important; cursor: pointer; }
-  .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr.selected td { background-color: #1a2540 !important; }
-
-  .nav-btn { transition: all .15s; }
-  .nav-btn:hover { background-color: #161929 !important; color: #c8d0e7 !important; }
+  *{box-sizing:border-box} html,body{margin:0;height:100%;background:#f3f6fb;font-family:Inter,Arial,sans-serif;}
+  ::-webkit-scrollbar{width:8px;height:8px} ::-webkit-scrollbar-track{background:#edf1f7} ::-webkit-scrollbar-thumb{background:#b8c2d3;border-radius:99px}
+  .nav-item:hover{background:#1d2b4a !important;transform:translateX(2px)}
+  .mini-card:hover,.panel:hover{box-shadow:0 14px 30px rgba(15,23,42,.08);transform:translateY(-1px)}
+  .pulse{animation:pulse 1.5s infinite}@keyframes pulse{0%{opacity:1}50%{opacity:.35}100%{opacity:1}}
+  .Select-control{border:1px solid #d8e0ec !important;border-radius:10px !important;min-height:38px !important;background:white !important;}
+  .Select-value-label,.Select-placeholder{font-size:12px;color:#475569 !important;}
+  .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr:hover td{background:#eef6ff !important;cursor:pointer;}
 </style>
 </head>
 <body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body>
-</html>'''
-
-# ── Palette ───────────────────────────────────────────────────────────────────
-C = {
-    "bg":      "#0b0d14", "sidebar": "#0d0f1a",
-    "surface": "#111420", "surface2": "#161929",
-    "border":  "#1e2236", "border2": "#252a42",
-    "text":    "#c8d0e7", "muted":   "#4a5270", "muted2": "#6b7494",
-    "danger":  "#ef4444", "success": "#22c55e",
-    "warning": "#f59e0b", "cyan":    "#38bdf8",
-    "blue":    "#3b82f6", "accent":  "#6366f1",
-}
-
-TABLE_COLS        = ["Timestamp", "Source", "Message", "Score IA", "Statut"]
-ALERT_TABLE_COLS  = ["Timestamp", "Source", "Host", "Message", "Score IA", "Ratio"]
-
-_HEADER = {
-    "backgroundColor": C["surface2"], "color": C["muted"],
-    "fontWeight": "600", "fontSize": "10px", "border": "none",
-    "borderBottom": f"1px solid {C['border']}",
-    "textTransform": "uppercase", "letterSpacing": "0.08em",
-    "padding": "10px 14px", "fontFamily": "'Space Mono', monospace", "whiteSpace": "nowrap",
-}
-_CELL = {
-    "backgroundColor": C["surface"], "color": C["text"],
-    "fontSize": "12px", "border": "none",
-    "borderBottom": f"1px solid {C['border']}",
-    "padding": "10px 14px", "overflow": "hidden",
-    "textOverflow": "ellipsis", "whiteSpace": "nowrap",
-    "fontFamily": "'DM Sans', sans-serif",
-}
+</html>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
+# UI HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _nav_btn(icon, label, page_id, active_page):
-    active = (active_page == page_id)
-    return html.Button(
-        [html.Span(icon, style={"fontSize": "16px", "lineHeight": "1"}), html.Span(label)],
-        id=f"nav-btn-{page_id}",
-        n_clicks=0,
-        className="nav-btn",
-        style={
-            "display": "flex", "alignItems": "center", "gap": "10px",
-            "width": "100%", "padding": "10px 14px", "borderRadius": "8px",
-            "border": "none", "cursor": "pointer", "textAlign": "left",
-            "backgroundColor": C["surface"] if active else "transparent",
-            "color": C["text"] if active else C["muted2"],
-            "fontSize": "13px", "fontWeight": "500",
-            "fontFamily": "'DM Sans', sans-serif",
-            "marginBottom": "2px",
-            "borderLeft": f"2px solid {C['accent']}" if active else "2px solid transparent",
-        },
-    )
+def _badge(text, color, bg=None):
+    return html.Span(text, style={
+        "display": "inline-flex", "alignItems": "center", "gap": "6px",
+        "padding": "4px 9px", "borderRadius": "999px", "fontSize": "11px",
+        "fontWeight": "700", "color": color, "backgroundColor": bg or f"{color}18",
+        "fontFamily": "JetBrains Mono, monospace",
+    })
 
 
-def _sidebar(active_page="logs"):
+def _sidebar():
     return html.Div(style={
-        "width": "200px", "minWidth": "200px",
-        "backgroundColor": C["sidebar"],
-        "borderRight": f"1px solid {C['border']}",
-        "display": "flex", "flexDirection": "column",
-        "height": "100%",
+        "width": "252px", "minWidth": "252px", "height": "100vh",
+        "background": "linear-gradient(180deg,#0f172a 0%,#111c33 70%,#172554 100%)",
+        "color": "white", "display": "flex", "flexDirection": "column",
+        "boxShadow": "10px 0 30px rgba(15,23,42,.18)", "zIndex": 10,
     }, children=[
-        # Logo
-        html.Div(style={
-            "padding": "20px 16px 18px",
-            "borderBottom": f"1px solid {C['border']}",
-            "display": "flex", "alignItems": "center", "gap": "10px",
-        }, children=[
-            html.Span("🛡️", style={"fontSize": "20px"}),
-            html.Div([
-                html.Span("LogGuardian", style={
-                    "fontSize": "13px", "fontWeight": "700", "color": C["text"],
-                    "fontFamily": "'DM Sans', sans-serif", "letterSpacing": "-0.01em",
+        html.Div(style={"padding": "24px 22px 18px"}, children=[
+            html.Div(style={"display": "flex", "alignItems": "center", "gap": "12px"}, children=[
+                html.Div("🛡", style={
+                    "width": "42px", "height": "42px", "borderRadius": "14px",
+                    "display": "grid", "placeItems": "center", "fontSize": "22px",
+                    "background": "linear-gradient(135deg,#38bdf8,#2563eb)",
+                    "boxShadow": "0 12px 28px rgba(37,99,235,.35)",
                 }),
-                html.Div("AIOps Platform", style={
-                    "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.08em",
-                    "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                    "marginTop": "1px",
-                }),
+                html.Div([
+                    html.Div("LogGuardian", style={"fontSize": "19px", "fontWeight": "800"}),
+                    html.Div("AIOps Command Center", style={"fontSize": "11px", "color": "#93a4c4", "marginTop": "2px"}),
+                ])
             ]),
         ]),
-
-        # Nav
-        html.Div(style={"padding": "14px 10px", "flex": "1"}, children=[
-            _nav_btn("▦", "Dashboard",          "dashboard", active_page),
-            _nav_btn("☰", "Historique des Logs","logs",      active_page),
-            _nav_btn("⚠", "Alertes",            "alerts",    active_page),
+        html.Div(style={"height": "1px", "background": "rgba(255,255,255,.09)", "margin": "0 18px 12px"}),
+        html.Div(style={"padding": "0 14px", "flex": 1}, children=[
+            _nav_button("dashboard", "▦", "Vue cockpit", "KPIs, graphes, services"),
+            _nav_button("logs", "≡", "Flux logs", "Recherche + RAG"),
+            _nav_button("alerts", "⚠", "Incident board", "Anomalies critiques"),
         ]),
-
-        # Kafka status
-        html.Div(id="kafka-status-indicator", style={
-            "padding": "14px 16px", "borderTop": f"1px solid {C['border']}",
-            "display": "flex", "alignItems": "center", "gap": "8px",
-        }, children=[
-            html.Div(className="live-dot", style={
-                "width": "7px", "height": "7px", "borderRadius": "50%",
-                "backgroundColor": C["success"],
-                "boxShadow": f"0 0 6px {C['success']}", "flexShrink": "0",
-            }),
-            html.Span("Kafka connecté", style={
-                "fontSize": "11px", "color": C["muted2"],
-                "fontFamily": "'Space Mono', monospace",
-            }),
+        html.Div(style={"padding": "18px", "borderTop": "1px solid rgba(255,255,255,.09)"}, children=[
+            html.Div(style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}, children=[
+                html.Span(className="pulse", style={"width": "9px", "height": "9px", "borderRadius": "50%", "background": "#22c55e", "display": "inline-block"}),
+                html.Span("Kafka connecté", style={"fontSize": "12px", "color": "#cbd5e1", "fontWeight": 700}),
+            ]),
+            html.Div(KAFKA_TOPIC, style={"fontSize": "11px", "fontFamily": "JetBrains Mono", "color": "#93a4c4", "wordBreak": "break-all"}),
         ]),
     ])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOPBAR helper
-# ─────────────────────────────────────────────────────────────────────────────
+def _nav_button(page_id, icon, title, subtitle):
+    return html.Button(id=f"nav-{page_id}", n_clicks=0, className="nav-item", style={
+        "width": "100%", "border": 0, "background": "transparent", "color": "white",
+        "padding": "12px 12px", "borderRadius": "14px", "display": "flex",
+        "alignItems": "center", "gap": "12px", "textAlign": "left", "cursor": "pointer",
+        "transition": "all .18s ease", "marginBottom": "7px", "fontFamily": "Inter",
+    }, children=[
+        html.Div(icon, style={"width": "32px", "height": "32px", "borderRadius": "10px", "display": "grid", "placeItems": "center", "background": "rgba(255,255,255,.09)", "fontSize": "17px"}),
+        html.Div([html.Div(title, style={"fontWeight": 800, "fontSize": "13px"}), html.Div(subtitle, style={"fontSize": "10px", "color": "#93a4c4", "marginTop": "2px"})])
+    ])
+
 
 def _topbar(title, subtitle):
     return html.Div(style={
-        "padding": "14px 20px",
-        "borderBottom": f"1px solid {C['border']}",
-        "backgroundColor": C["surface"],
-        "display": "flex", "alignItems": "center",
-        "justifyContent": "space-between", "flexShrink": "0",
+        "height": "74px", "display": "flex", "alignItems": "center", "justifyContent": "space-between",
+        "padding": "0 26px", "background": "rgba(255,255,255,.88)", "backdropFilter": "blur(10px)",
+        "borderBottom": f"1px solid {T['border']}", "position": "sticky", "top": 0, "zIndex": 5,
     }, children=[
-        html.Div([
-            html.H1(title, style={
-                "fontSize": "13px", "fontWeight": "700", "letterSpacing": "0.08em",
-                "color": C["text"], "fontFamily": "'Space Mono', monospace",
-            }),
-            html.P(subtitle, style={
-                "fontSize": "10px", "color": C["muted"],
-                "fontFamily": "'Space Mono', monospace", "marginTop": "1px",
-            }),
-        ]),
-        html.Div(style={
-            "display": "flex", "alignItems": "center", "gap": "8px",
-            "backgroundColor": C["surface2"], "border": f"1px solid {C['border2']}",
-            "borderRadius": "8px", "padding": "6px 12px",
-            "fontSize": "11px", "fontFamily": "'Space Mono', monospace", "color": C["muted2"],
-        }, children=[
-            html.Span("📅"),
-            html.Span(datetime.now().strftime("%A %d %B %Y").upper()),
-            html.Span("🕐"),
-            html.Span(id="time-display"),
-        ]),
+        html.Div([html.H1(title, style={"margin": 0, "fontSize": "22px", "fontWeight": "850", "letterSpacing": "-.03em", "color": T["text"]}),
+                  html.Div(subtitle, style={"fontSize": "12px", "color": T["muted"], "marginTop": "3px"})]),
+        html.Div(style={"display": "flex", "alignItems": "center", "gap": "10px"}, children=[
+            _badge("● LIVE", T["green"]),
+            html.Div(id="clock", style={"fontFamily": "JetBrains Mono", "fontSize": "12px", "color": T["muted"], "background": T["paper2"], "border": f"1px solid {T['border']}", "padding": "8px 12px", "borderRadius": "12px"}),
+        ])
     ])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KPI CARD
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _kpi(icon, label, value_id, color=None, badge=None, initial_value="—"):
-    return html.Div(style={
-        "backgroundColor": C["surface"],
-        "border": f"1px solid {C['border']}",
-        "borderRadius": "10px", "padding": "16px 18px",
-        "flex": "1", "minWidth": "140px",
-        "borderTop": f"3px solid {color or C['accent']}",
+def _metric_card(label, value_id, accent, icon, hint=""):
+    return html.Div(className="mini-card", style={
+        "background": T["paper"], "border": f"1px solid {T['border']}", "borderRadius": "18px",
+        "padding": "16px", "boxShadow": "0 8px 22px rgba(15,23,42,.05)", "transition": "all .18s ease",
+        "borderTop": f"4px solid {accent}", "minHeight": "126px",
     }, children=[
-        html.Div(style={
-            "display": "flex", "justifyContent": "space-between",
-            "alignItems": "flex-start", "marginBottom": "10px",
-        }, children=[
-            html.Span(icon, style={"fontSize": "20px"}),
-            html.Span(badge or "", style={
-                "fontSize": "9px", "color": color or C["muted2"],
-                "fontFamily": "'Space Mono', monospace",
-                "letterSpacing": "0.06em",
-            }),
+        html.Div(style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}, children=[
+            html.Div(icon, style={"fontSize": "22px"}),
+            html.Div(hint, style={"fontSize": "10px", "fontWeight": 800, "color": accent, "fontFamily": "JetBrains Mono"}),
         ]),
-        html.Div(id=value_id, style={
-            "fontSize": "26px", "fontWeight": "700",
-            "color": color or C["text"],
-            "fontFamily": "'Space Mono', monospace", "lineHeight": "1",
-        }, children=initial_value),
-        html.Div(label, style={
-            "fontSize": "10px", "color": C["muted"], "marginTop": "6px",
-            "textTransform": "uppercase", "letterSpacing": "0.07em",
-            "fontFamily": "'Space Mono', monospace",
-        }),
+        html.Div(id=value_id, style={"fontSize": "32px", "fontWeight": "900", "color": T["text"], "marginTop": "12px", "letterSpacing": "-.04em"}, children="0"),
+        html.Div(label, style={"fontSize": "11px", "fontWeight": 800, "color": T["muted"], "textTransform": "uppercase", "letterSpacing": ".08em"}),
     ])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PLOTLY chart helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def _panel(title, children, footer=None, height=None):
+    return html.Div(className="panel", style={
+        "background": T["paper"], "border": f"1px solid {T['border']}", "borderRadius": "18px",
+        "boxShadow": "0 8px 22px rgba(15,23,42,.05)", "overflow": "hidden", "transition": "all .18s ease", "height": height or "auto",
+    }, children=[
+        html.Div(style={"padding": "14px 16px", "borderBottom": f"1px solid {T['border2']}", "display": "flex", "justifyContent": "space-between", "alignItems": "center"}, children=[
+            html.Div(title, style={"fontSize": "12px", "fontWeight": 900, "color": T["text"], "textTransform": "uppercase", "letterSpacing": ".08em"}),
+            footer or html.Div(),
+        ]),
+        html.Div(style={"padding": "14px 16px"}, children=children),
+    ])
 
-_PLOT_LAYOUT = dict(
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(family="Space Mono, monospace", color="#6b7494", size=10),
-    margin=dict(l=40, r=16, t=16, b=36),
-    xaxis=dict(gridcolor="#1e2236", showgrid=True, zeroline=False,
-               tickfont=dict(size=9), linecolor="#1e2236"),
-    yaxis=dict(gridcolor="#1e2236", showgrid=True, zeroline=False,
-               tickfont=dict(size=9)),
-    legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=9)),
-    hovermode="x unified",
-)
 
-def _empty_fig(msg="En attente de données…"):
+def _empty_fig(text="En attente de données"):
     fig = go.Figure()
-    fig.update_layout(**_PLOT_LAYOUT,
-        annotations=[dict(text=msg, x=0.5, y=0.5, xref="paper",
-                          yref="paper", showarrow=False,
-                          font=dict(color="#4a5270", size=12))])
-    return fig
-
-def _anomaly_timeline_fig(rows):
-    """Anomalies sur les derniers événements reçus."""
-    if not rows:
-        return _empty_fig()
-
-    recent = list(reversed(rows[:50]))
-
-    labels = [str(i + 1) for i in range(len(recent))]
-    anomalies = [1 if r.get("Statut") == "ANOMALIE" else 0 for r in recent]
-    normals = [1 if r.get("Statut") == "NORMAL" else 0 for r in recent]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        name="Normal",
-        x=labels,
-        y=normals,
-        marker_color="#22c55e33",
-        marker_line_color="#22c55e",
-        marker_line_width=1
-    ))
-    fig.add_trace(go.Bar(
-        name="Anomalie",
-        x=labels,
-        y=anomalies,
-        marker_color="#ef444466",
-        marker_line_color="#ef4444",
-        marker_line_width=1
-    ))
-
     fig.update_layout(
-        **_PLOT_LAYOUT,
-        barmode="stack",
-        yaxis_title="Événements",
-        xaxis_title="Derniers logs reçus"
+        paper_bgcolor="white", plot_bgcolor="white", height=260,
+        margin=dict(l=20, r=20, t=20, b=20),
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        annotations=[dict(text=text, x=.5, y=.5, xref="paper", yref="paper", showarrow=False, font=dict(color="#94a3b8", size=14))]
     )
     return fig
-# def _anomaly_timeline_fig(rows):
-#     """Anomalies par minute sur les 30 dernières minutes."""
-#     if not rows:
-#         return _empty_fig()
-#     now = datetime.now()
-#     buckets = {}
-#     for i in range(30):
-#         t = (now - timedelta(minutes=i)).strftime("%H:%M")
-#         buckets[t] = {"anomalie": 0, "normal": 0}
 
-#     for r in rows:
-#         try:
-#             ts = datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M:%S")
-#             diff = (now - ts).total_seconds() / 60
-#             if 0 <= diff < 30:
-#                 key = ts.strftime("%H:%M")
-#                 if key in buckets:
-#                     if r.get("Statut") == "ANOMALIE":
-#                         buckets[key]["anomalie"] += 1
-#                     else:
-#                         buckets[key]["normal"] += 1
-#         except Exception:
-#             pass
 
-#     labels = sorted(buckets.keys())
-#     anomalies = [buckets[k]["anomalie"] for k in labels]
-#     normals   = [buckets[k]["normal"]   for k in labels]
+def _plot_layout(height=260):
+    return dict(
+        height=height, paper_bgcolor="white", plot_bgcolor="white",
+        margin=dict(l=36, r=16, t=18, b=34),
+        font=dict(family="Inter", color="#475569", size=11),
+        xaxis=dict(gridcolor="#eef2f7", zeroline=False),
+        yaxis=dict(gridcolor="#eef2f7", zeroline=False),
+        legend=dict(orientation="h", y=1.08, x=0, bgcolor="rgba(0,0,0,0)")
+    )
 
-#     fig = go.Figure()
-#     fig.add_trace(go.Bar(name="Normal",   x=labels, y=normals,
-#                          marker_color="#22c55e33", marker_line_color="#22c55e",
-#                          marker_line_width=1))
-#     fig.add_trace(go.Bar(name="Anomalie", x=labels, y=anomalies,
-#                          marker_color="#ef444466", marker_line_color="#ef4444",
-#                          marker_line_width=1))
-#     fig.update_layout(**_PLOT_LAYOUT, barmode="stack",
-#                       yaxis_title="Événements")
-#     return fig
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE LAYOUTS
+# ─────────────────────────────────────────────────────────────────────────────
+def _dashboard_page():
+    return html.Div(id="page-dashboard", style={"display": "none", "height": "100%", "overflow": "auto"}, children=[
+        _topbar("Cockpit observabilité", "Vue radicale temps réel — anomalies, risque et santé des services"),
+        html.Div(style={"padding": "22px", "display": "grid", "gap": "18px"}, children=[
+            html.Div(style={"display": "grid", "gridTemplateColumns": "repeat(5, minmax(0, 1fr))", "gap": "14px"}, children=[
+                _metric_card("logs reçus", "m-total", T["blue"], "📥", "STREAM"),
+                _metric_card("anomalies", "m-anom", T["red"], "🔥", f"> {ALERT_THRESHOLD}x"),
+                _metric_card("score moyen", "m-score", T["purple"], "🧠", "ML"),
+                _metric_card("sources touchées", "m-sources", T["cyan"], "🖥", "SVC"),
+                _metric_card("risk level", "m-risk", T["orange"], "⚡", "AIOPS"),
+            ]),
+            html.Div(style={"display": "grid", "gridTemplateColumns": "1.25fr .75fr", "gap": "18px"}, children=[
+                _panel("Flux anomalies / normal", dcc.Graph(id="fig-stream", config={"displayModeBar": False})),
+                _panel("Jauge risque global", dcc.Graph(id="fig-risk", config={"displayModeBar": False})),
+            ]),
+            html.Div(style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr", "gap": "18px"}, children=[
+                _panel("Top services impactés", dcc.Graph(id="fig-services", config={"displayModeBar": False})),
+                _panel("Score IA — derniers événements", dcc.Graph(id="fig-score", config={"displayModeBar": False})),
+                _panel("Briefing analyste IA", html.Div(id="ai-briefing")),
+            ]),
+        ])
+    ])
 
-def _score_timeline_fig(rows):
-    """Score IA sur les derniers événements reçus."""
+
+def _filters_bar():
+    dropdown_style = {"fontSize": "12px"}
+    return html.Div(style={"display": "grid", "gridTemplateColumns": "1.5fr .7fr .7fr .55fr", "gap": "10px", "alignItems": "center"}, children=[
+        dcc.Input(id="search-text", placeholder="Rechercher : ssh, timeout, kerberos, error, host...", debounce=False, style={
+            "height": "40px", "borderRadius": "12px", "border": f"1px solid {T['border']}", "padding": "0 14px", "outline": "none", "fontSize": "13px", "background": "white",
+        }),
+        dcc.Dropdown(id="source-filter", placeholder="Source", clearable=True, style=dropdown_style),
+        dcc.Dropdown(id="level-filter", value="all", clearable=False, style=dropdown_style, options=[
+            {"label": "Tous", "value": "all"}, {"label": f"Anomalies > {ALERT_THRESHOLD}x", "value": "high"}, {"label": f"Normaux ≤ {ALERT_THRESHOLD}x", "value": "normal"},
+        ]),
+        dcc.Dropdown(id="limit-filter", value=200, clearable=False, style=dropdown_style, options=[
+            {"label": "200", "value": 200}, {"label": "500", "value": 500}, {"label": "1000", "value": 1000}, {"label": "Max", "value": MAX_ROWS},
+        ]),
+    ])
+
+
+def _logs_page():
+    return html.Div(id="page-logs", style={"display": "block", "height": "100%", "overflow": "hidden"}, children=[
+        _topbar("Flux logs augmenté", "Table temps réel + panneau analyste IA avec recommandation et feedback"),
+        html.Div(style={"height": "calc(100% - 74px)", "display": "grid", "gridTemplateColumns": "minmax(0, 1fr) 380px", "gap": "18px", "padding": "18px", "overflow": "hidden"}, children=[
+            html.Div(style={"minWidth": 0, "display": "flex", "flexDirection": "column", "gap": "14px"}, children=[
+                _panel("Recherche & filtrage", _filters_bar(), footer=html.Div(id="logs-count", style={"fontSize": "12px", "fontWeight": 800, "color": T["muted"]})),
+                html.Div(style={"flex": 1, "minHeight": 0}, children=[
+                    dash_table.DataTable(
+                        id="main-table",
+                        columns=[{"name": c, "id": c} for c in TABLE_COLS],
+                        data=[],
+                        cell_selectable=True,
+                        active_cell=None,
+                        # row_selectable="single",
+                        # selected_row_ids=[],
+                        sort_action="native",
+                        page_action="native",
+                        page_size=22,
+                        fixed_rows={"headers": True},
+                        style_table={"height": "560px", "overflowY": "auto", "overflowX": "auto", "border": f"1px solid {T['border']}", "borderRadius": "18px"},
+                        style_header={"backgroundColor": "#eaf0f8", "fontWeight": "900", "fontSize": "11px", "color": T["muted"], "border": "none", "padding": "11px", "textTransform": "uppercase", "fontFamily": "JetBrains Mono"},
+                        style_cell={"backgroundColor": "white", "fontSize": "12px", "color": T["text"], "border": "none", "borderBottom": f"1px solid {T['border2']}", "padding": "10px", "fontFamily": "Inter", "whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
+                        style_cell_conditional=[
+                            {"if": {"column_id": "Message"}, "minWidth": "420px", "whiteSpace": "normal"},
+                            {"if": {"column_id": "Timestamp"}, "fontFamily": "JetBrains Mono", "color": T["muted"], "minWidth": "150px"},
+                            {"if": {"column_id": "Score IA"}, "fontFamily": "JetBrains Mono", "fontWeight": "800", "textAlign": "center", "minWidth": "85px"},
+                            {"if": {"column_id": "Ratio"}, "fontFamily": "JetBrains Mono", "fontWeight": "800", "textAlign": "center", "minWidth": "80px"},
+                            {"if": {"column_id": "Statut"}, "fontWeight": "900", "textAlign": "center", "minWidth": "110px"},
+                        ],
+                        style_data_conditional=[
+                            {"if": {"row_index": "odd"}, "backgroundColor": T["paper2"]},
+                            {"if": {"filter_query": '{Statut} = "ANOMALIE"', "column_id": "Statut"}, "color": T["red"]},
+                            {"if": {"filter_query": '{Statut} = "NORMAL"', "column_id": "Statut"}, "color": T["green"]},
+                            {"if": {"state": "selected"}, "backgroundColor": "#dbeafe", "border": f"1px solid {T['blue']}"},
+                        ],
+                    )
+                ])
+            ]),
+            _rag_side_panel(),
+        ])
+    ])
+
+
+def _rag_side_panel():
+    return html.Div(style={"height": "100%", "overflow": "auto"}, children=[
+        html.Div(style={"background": "linear-gradient(180deg,#0f172a 0%,#172554 100%)", "borderRadius": "22px", "padding": "18px", "color": "white", "minHeight": "100%", "boxShadow": "0 18px 40px rgba(15,23,42,.22)"}, children=[
+            html.Div(style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "16px"}, children=[
+                html.Div([html.Div("🤖 Analyste IA", style={"fontSize": "18px", "fontWeight": 900}), html.Div("RAG • recommandation • feedback", style={"fontSize": "11px", "color": "#9fb2d8", "marginTop": "2px"})]),
+                html.Div(id="rag-status-chip", children=_badge("Aucun log", "#93c5fd", "rgba(147,197,253,.13)")),
+            ]),
+            _rag_block("Log sélectionné", "rag-desc"),
+            html.Div(style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px", "marginBottom": "12px"}, children=[
+                html.Div(style={"background": "rgba(255,255,255,.08)", "border": "1px solid rgba(255,255,255,.12)", "borderRadius": "16px", "padding": "12px"}, children=[html.Div("Score IA", style={"fontSize": "10px", "color": "#9fb2d8", "fontWeight": 800}), html.Div(id="rag-score", style={"fontSize": "24px", "fontWeight": 900, "fontFamily": "JetBrains Mono"}, children="—")]),
+                html.Div(style={"background": "rgba(255,255,255,.08)", "border": "1px solid rgba(255,255,255,.12)", "borderRadius": "16px", "padding": "12px"}, children=[html.Div("Ratio", style={"fontSize": "10px", "color": "#9fb2d8", "fontWeight": 800}), html.Div(id="rag-ratio", style={"fontSize": "24px", "fontWeight": 900, "fontFamily": "JetBrains Mono"}, children="—")]),
+            ]),
+            _rag_block("Analyse RAG", "rag-analysis"),
+            _rag_block("Action recommandée", "rag-action"),
+            html.Div(style={"marginTop": "14px", "paddingTop": "14px", "borderTop": "1px solid rgba(255,255,255,.12)"}, children=[
+                html.Div("Feedback utilisateur", style={"fontSize": "11px", "fontWeight": 900, "color": "#cbd5e1", "textTransform": "uppercase", "letterSpacing": ".08em", "marginBottom": "10px"}),
+                html.Div(style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px"}, children=[
+                    html.Button("👍 Utile", id="fb-up", n_clicks=0, style={"height": "38px", "borderRadius": "12px", "border": "1px solid rgba(34,197,94,.45)", "background": "rgba(34,197,94,.12)", "color": "#bbf7d0", "fontWeight": 900, "cursor": "pointer"}),
+                    html.Button("👎 Pas utile", id="fb-down", n_clicks=0, style={"height": "38px", "borderRadius": "12px", "border": "1px solid rgba(248,113,113,.45)", "background": "rgba(248,113,113,.12)", "color": "#fecaca", "fontWeight": 900, "cursor": "pointer"}),
+                ]),
+                html.Div(id="feedback-status", style={"fontSize": "12px", "color": "#9fb2d8", "marginTop": "10px"}, children="Le feedback sera sauvegardé pour évaluer le RAG."),
+            ])
+        ])
+    ])
+
+
+def _rag_block(title, component_id):
+    return html.Div(style={"marginBottom": "12px"}, children=[
+        html.Div(title, style={"fontSize": "10px", "fontWeight": 900, "color": "#9fb2d8", "textTransform": "uppercase", "letterSpacing": ".08em", "marginBottom": "7px"}),
+        html.Div(id=component_id, style={"background": "rgba(255,255,255,.08)", "border": "1px solid rgba(255,255,255,.12)", "borderLeft": "4px solid #38bdf8", "borderRadius": "16px", "padding": "13px", "fontSize": "13px", "lineHeight": "1.55", "color": "#e2e8f0"}, children="Sélectionnez un log dans le tableau."),
+    ])
+
+
+def _alerts_page():
+    return html.Div(id="page-alerts", style={"display": "none", "height": "100%", "overflow": "auto"}, children=[
+        _topbar("Incident board", f"Événements dont le ratio dépasse {ALERT_THRESHOLD}x"),
+        html.Div(style={"padding": "22px", "display": "grid", "gap": "18px"}, children=[
+            html.Div(id="alert-strip"),
+            html.Div(style={"background": "white", "border": f"1px solid {T['border']}", "borderRadius": "18px", "overflow": "hidden"}, children=[
+                dash_table.DataTable(
+                    id="alert-table", columns=[{"name": c, "id": c} for c in ALERT_COLS], data=[],
+                    sort_action="native", page_action="native", page_size=30,
+                    style_table={"overflowX": "auto"},
+                    style_header={"backgroundColor": "#fee2e2", "fontWeight": "900", "fontSize": "11px", "color": T["red"], "border": "none", "padding": "12px", "textTransform": "uppercase", "fontFamily": "JetBrains Mono"},
+                    style_cell={"backgroundColor": "white", "fontSize": "12px", "color": T["text"], "border": "none", "borderBottom": f"1px solid {T['border2']}", "padding": "11px", "fontFamily": "Inter"},
+                    style_cell_conditional=[{"if": {"column_id": "Message"}, "minWidth": "520px", "whiteSpace": "normal"}, {"if": {"column_id": "Ratio"}, "color": T["red"], "fontWeight": 900, "fontFamily": "JetBrains Mono"}],
+                )
+            ])
+        ])
+    ])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROOT LAYOUT — all pages mounted once, only hidden/shown
+# ─────────────────────────────────────────────────────────────────────────────
+app.layout = html.Div(style={"height": "100vh", "display": "flex", "background": T["bg"], "overflow": "hidden"}, children=[
+    _sidebar(),
+    html.Div(style={"flex": 1, "minWidth": 0, "height": "100vh", "overflow": "hidden"}, children=[
+        _dashboard_page(),
+        _logs_page(),
+        _alerts_page(),
+    ]),
+    dcc.Interval(id="interval", interval=REFRESH_INTERVAL_MS, n_intervals=0),
+    dcc.Store(id="current-page", data="logs"),
+    dcc.Store(id="rows-store", data=[]),
+    dcc.Store(id="selected-log-store", data=None),
+])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA + FIGURES
+# ─────────────────────────────────────────────────────────────────────────────
+def _visible_rows():
+    with _lock:
+        return list(_buffer), _total_received
+
+
+def _filter_rows(rows, search, source, level, limit):
+    search = (search or "").lower().strip()
+    level = level or "all"
+    limit = int(limit or 200)
+    out = []
+    for r in rows:
+        if search:
+            hay = " ".join([r.get("Timestamp", ""), r.get("Source", ""), r.get("Host", ""), r.get("Message", ""), r.get("Statut", "")]).lower()
+            if search not in hay:
+                continue
+        if source and r.get("Source") != source:
+            continue
+        if level == "high" and r.get("_ratio_val", 0) <= ALERT_THRESHOLD:
+            continue
+        if level == "normal" and r.get("_ratio_val", 0) > ALERT_THRESHOLD:
+            continue
+        out.append(r)
+    return out[:limit]
+
+
+def _display_row(r, include_model=False):
+    cols = TABLE_COLS + (["Model"] if include_model else [])
+    d = {k: r.get(k, "") for k in cols}
+    d["id"] = r.get("id")
+    return d
+
+
+def _stream_fig(rows):
     if not rows:
         return _empty_fig()
-
-    recent = list(reversed(rows[:50]))
-
-    xs = [str(i + 1) for i in range(len(recent))]
-    ys = [float(r.get("Score IA", 0)) for r in recent]
-
+    recent = list(reversed(rows[:60]))
+    x = list(range(1, len(recent) + 1))
+    normal = [1 if r.get("Statut") == "NORMAL" else 0 for r in recent]
+    anom = [1 if r.get("Statut") == "ANOMALIE" else 0 for r in recent]
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=xs,
-        y=ys,
-        mode="lines+markers",
-        name="Score IA",
-        line=dict(color="#6366f1", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(99,102,241,0.08)",
-    ))
-
-    fig.add_hline(
-        y=0.8,
-        line_dash="dash",
-        line_color="#ef4444",
-        annotation_text="Seuil critique",
-        annotation_font_size=9,
-        annotation_font_color="#ef4444"
-    )
-
-    layout = dict(**_PLOT_LAYOUT)
-    layout["yaxis"] = dict(**_PLOT_LAYOUT["yaxis"], range=[0, 1.05])
-
-    fig.update_layout(**layout, xaxis_title="Derniers logs reçus")
+    fig.add_trace(go.Bar(x=x, y=normal, name="Normal", marker_color="#86efac"))
+    fig.add_trace(go.Bar(x=x, y=anom, name="Anomalie", marker_color="#f87171"))
+    fig.update_layout(**_plot_layout(280), barmode="stack", yaxis_title="events", xaxis_title="derniers logs")
     return fig
 
-# def _score_timeline_fig(rows):
-#     """Score IA moyen glissant."""
-#     if not rows:
-#         return _empty_fig()
-#     now = datetime.now()
-#     pts = []
-#     for r in rows:
-#         try:
-#             ts = datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M:%S")
-#             diff = (now - ts).total_seconds() / 60
-#             if 0 <= diff < 30:
-#                 pts.append((ts, float(r.get("Score IA", 0))))
-#         except Exception:
-#             pass
-#     if not pts:
-#         return _empty_fig()
-#     pts.sort(key=lambda x: x[0])
-#     xs = [p[0].strftime("%H:%M:%S") for p in pts]
-#     ys = [p[1] for p in pts]
 
-#     fig = go.Figure()
-#     fig.add_trace(go.Scatter(
-#         x=xs, y=ys, mode="lines", name="Score IA",
-#         line=dict(color="#6366f1", width=2),
-#         fill="tozeroy", fillcolor="rgba(99,102,241,0.08)",
-#     ))
-#     fig.add_hline(y=0.8, line_dash="dash", line_color="#ef4444",
-#                   annotation_text="Seuil critique", annotation_font_size=9,
-#                   annotation_font_color="#ef4444")
-#     fig.update_layout(**_PLOT_LAYOUT, yaxis=dict(range=[0, 1.05], **_PLOT_LAYOUT["yaxis"]))
-#     return fig
+def _score_fig(rows):
+    if not rows:
+        return _empty_fig()
+    recent = list(reversed(rows[:60]))
+    x = list(range(1, len(recent) + 1))
+    y = [r.get("_score_val", 0) for r in recent]
+    fig = go.Figure(go.Scatter(x=x, y=y, mode="lines+markers", line=dict(color=T["purple"], width=3), marker=dict(size=5), fill="tozeroy", fillcolor="rgba(124,58,237,.10)", name="Score IA"))
+    fig.add_hline(y=ALERT_THRESHOLD, line_dash="dash", line_color=T["red"], annotation_text="seuil")
+    fig.update_layout(**_plot_layout(240))
+    return fig
 
 
 def _services_fig(rows):
-    """Top services touchés par des anomalies."""
     if not rows:
         return _empty_fig()
-    counts = {}
-    for r in rows:
-        if r.get("Statut") == "ANOMALIE":
-            s = r.get("Source", "unknown")
-            counts[s] = counts.get(s, 0) + 1
-    if not counts:
-        return _empty_fig("Aucune anomalie détectée")
-    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:8]
-    labels = [t[0] for t in top]
-    values = [t[1] for t in top]
-
-    colors = ["#6366f1", "#3b82f6", "#38bdf8", "#22c55e",
-              "#f59e0b", "#ef4444", "#ec4899", "#8b5cf6"]
-
-    fig = go.Figure(go.Bar(
-        x=values, y=labels, orientation="h",
-        marker_color=colors[:len(labels)],
-        marker_line_width=0,
-    ))
-    layout = dict(**_PLOT_LAYOUT)
-    layout["margin"] = dict(l=120, r=16, t=16, b=36)
-    fig.update_layout(**layout, xaxis_title="Nb anomalies")
+    cnt = Counter(r.get("Source", "unknown") for r in rows if r.get("Statut") == "ANOMALIE")
+    if not cnt:
+        return _empty_fig("Aucune anomalie critique")
+    top = cnt.most_common(8)
+    fig = go.Figure(go.Bar(x=[v for _, v in top], y=[k for k, _ in top], orientation="h", marker_color=T["cyan"]))
+    layout = _plot_layout(240)
+    layout["margin"] = dict(l=90, r=16, t=18, b=34)
+    fig.update_layout(**layout)
     return fig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DASHBOARD PAGE
-# ─────────────────────────────────────────────────────────────────────────────
+def _risk_fig(rows):
+    if not rows:
+        val = 0
+    else:
+        anom = sum(1 for r in rows if r.get("Statut") == "ANOMALIE")
+        avg_ratio = sum(r.get("_ratio_val", 0) for r in rows[:200]) / max(1, len(rows[:200]))
+        val = min(100, round((anom / max(1, len(rows)) * 70) + avg_ratio * 12, 1))
+    color = T["green"] if val < 35 else T["orange"] if val < 70 else T["red"]
+    fig = go.Figure(go.Indicator(mode="gauge+number", value=val, number={"suffix": "%", "font": {"size": 42, "color": color}}, gauge={"axis": {"range": [0, 100]}, "bar": {"color": color}, "bgcolor": "#f8fafc", "bordercolor": T["border"]}, title={"text": "Risk score"}))
+    fig.update_layout(**_plot_layout(280))
+    return fig
 
-def _health_badge(label, ok=True):
-    color  = C["success"] if ok else C["danger"]
-    status = "OK" if ok else "DOWN"
-    return html.Div(style={
-        "display": "flex", "alignItems": "center", "gap": "10px",
-        "backgroundColor": C["surface2"],
-        "border": f"1px solid {C['border']}",
-        "borderLeft": f"3px solid {color}",
-        "borderRadius": "8px", "padding": "10px 14px", "flex": "1",
-    }, children=[
-        html.Div(style={
-            "width": "8px", "height": "8px", "borderRadius": "50%",
-            "backgroundColor": color,
-            "boxShadow": f"0 0 6px {color}",
-        }),
-        html.Div([
-            html.Div(label, style={
-                "fontSize": "11px", "color": C["text"], "fontWeight": "600",
-                "fontFamily": "'Space Mono', monospace",
-            }),
-            html.Div(status, style={
-                "fontSize": "10px", "color": color,
-                "fontFamily": "'Space Mono', monospace", "letterSpacing": "0.06em",
-            }),
+
+def _ai_briefing(rows):
+    if not rows:
+        return html.Div("Aucun événement reçu pour le moment.", style={"color": T["muted"], "fontSize": "13px"})
+    recent = rows[:80]
+    anom = [r for r in recent if r.get("Statut") == "ANOMALIE"]
+    top_src = Counter(r.get("Source", "unknown") for r in anom).most_common(1)
+    src_txt = top_src[0][0] if top_src else "aucune source critique"
+    risk = "ÉLEVÉ" if len(anom) > 20 else "MOYEN" if len(anom) > 5 else "FAIBLE"
+    color = T["red"] if risk == "ÉLEVÉ" else T["orange"] if risk == "MOYEN" else T["green"]
+    return html.Div(style={"display": "grid", "gap": "10px"}, children=[
+        html.Div([html.Div("Synthèse automatique", style={"fontWeight": 900, "fontSize": "13px"}), html.Div(f"{len(recent)} événements récents analysés", style={"color": T["muted"], "fontSize": "12px", "marginTop": "2px"})]),
+        html.Div(style={"padding": "12px", "background": T["paper2"], "borderRadius": "14px", "border": f"1px solid {T['border2']}"}, children=[
+            html.Div(f"Risque global : {risk}", style={"fontWeight": 900, "color": color}),
+            html.Div(f"Anomalies détectées : {len(anom)}", style={"fontSize": "12px", "color": T["muted"], "marginTop": "5px"}),
+            html.Div(f"Source la plus touchée : {src_txt}", style={"fontSize": "12px", "color": T["muted"], "marginTop": "3px"}),
         ]),
+        html.Div("Recommandation : prioriser les logs avec ratio élevé, vérifier les services impactés et utiliser le feedback RAG pour améliorer les explications.", style={"fontSize": "12px", "lineHeight": "1.55", "color": T["text"]}),
     ])
 
 
-def _chart_card(title, graph_id, initial_figure=None):
-    return html.Div(style={
-        "backgroundColor": C["surface"],
-        "border": f"1px solid {C['border']}",
-        "borderRadius": "10px", "overflow": "hidden", "flex": "1",
-    }, children=[
-        html.Div(title, style={
-            "padding": "12px 16px",
-            "borderBottom": f"1px solid {C['border']}",
-            "fontSize": "10px", "fontWeight": "700",
-            "color": C["muted"], "letterSpacing": "0.08em",
-            "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-        }),
-        dcc.Graph(id=graph_id, config={"displayModeBar": False},
-                  style={"height": "200px"},
-                  figure=initial_figure if initial_figure is not None else _empty_fig()),
-    ])
-
-
-def _page_dashboard(init_data=None):
-    d = init_data or {}
-    return html.Div(style={
-        "flex": "1", "display": "flex", "flexDirection": "column",
-        "overflow": "hidden", "minWidth": "0",
-    }, children=[
-        _topbar("DASHBOARD", "Vue globale — temps réel"),
-
-        html.Div(style={
-            "flex": "1", "overflow": "auto", "padding": "20px",
-        }, children=[
-
-            # KPI row
-            html.Div(style={"display": "flex", "gap": "14px", "marginBottom": "20px"}, children=[
-                _kpi("📊", "Total anomalies",   "kpi-total",     C["accent"],  "TOTAL",    d.get("total", "—")),
-                _kpi("🔴", "Sévérité haute",    "kpi-high",      C["danger"],  "> 1.3x",   d.get("high", "—")),
-                _kpi("⚡", "Score IA moyen",    "kpi-avg-score", C["blue"],    "MOY.",     d.get("avg_score", "—")),
-                _kpi("⏱️", "Anomalies total",   "kpi-rate",      C["warning"], "RATE",     d.get("rate", "—")),
-                _kpi("🖥️", "Services touchés",  "kpi-services",  C["cyan"],    "SERVICES", d.get("services", "—")),
-            ]),
-
-            # Charts row 1
-            html.Div(style={"display": "flex", "gap": "14px", "marginBottom": "14px"}, children=[
-                _chart_card("Anomalies — derniers logs reçus", "graph-timeline", d.get("fig_timeline")),
-                _chart_card("Score IA — derniers logs reçus","graph-score", d.get("fig_score")),
-            ]),
-
-            # Charts row 2 + Health
-            html.Div(style={"display": "flex", "gap": "14px"}, children=[
-                _chart_card("Top services touchés", "graph-services", d.get("fig_services")),
-
-                # Health panel
-                html.Div(style={
-                    "backgroundColor": C["surface"],
-                    "border": f"1px solid {C['border']}",
-                    "borderRadius": "10px", "flex": "1", "overflow": "hidden",
-                }, children=[
-                    html.Div("Health — Infrastructure", style={
-                        "padding": "12px 16px",
-                        "borderBottom": f"1px solid {C['border']}",
-                        "fontSize": "10px", "fontWeight": "700",
-                        "color": C["muted"], "letterSpacing": "0.08em",
-                        "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                    }),
-                    html.Div(id="health-panel", style={"padding": "14px", "display": "flex", "flexDirection": "column", "gap": "10px"},
-                             children=d.get("health", [])),
-                ]),
-            ]),
-        ]),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGS PAGE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _filter_bar():
-    return html.Div(style={
-        "padding": "14px 20px",
-        "borderBottom": f"1px solid {C['border']}",
-        "backgroundColor": C["surface2"], "flexShrink": "0",
-    }, children=[
-        html.Div("Recherche et filtrage dynamiques", style={
-            "fontSize": "10px", "color": C["muted"], "letterSpacing": "0.1em",
-            "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-            "marginBottom": "10px",
-        }),
-        html.Div(style={
-            "display": "grid",
-            "gridTemplateColumns": "1fr 160px 160px 140px", "gap": "10px",
-        }, children=[
-            dcc.Input(
-                id="search-text", type="text", debounce=False,
-                placeholder="Filtrer par mots-clés : timeout, 404, injection, host...",
-                style={
-                    "width": "100%", "height": "36px",
-                    "backgroundColor": "#0e1428", "border": "1px solid #3b82f6",
-                    "borderRadius": "6px", "color": C["text"], "padding": "0 12px",
-                    "outline": "none", "fontSize": "12px",
-                    "fontFamily": "'DM Sans', sans-serif",
-                },
-            ),
-            dcc.Dropdown(id="source-filter", placeholder="SERVICE", clearable=True,
-                         style={"fontSize": "11px"}),
-            dcc.Dropdown(id="level-filter", placeholder="NIVEAU", clearable=True,
-                         options=[
-                             {"label": "Toutes sévérités", "value": "all"},
-                             {"label": "ANOMALIE (> 1.3x)", "value": "high"},
-                             {"label": "NORMAL (≤ 1.3x)",  "value": "normal"},
-                         ], value="all", style={"fontSize": "11px"}),
-            dcc.Dropdown(id="limit-filter", placeholder="PÉRIODE", clearable=False,
-                         options=[
-                             {"label": "Temps réel", "value": 200},
-                             {"label": "1 heure",    "value": 500},
-                             {"label": "24 heures",  "value": MAX_ROWS},
-                         ], value=200, style={"fontSize": "11px"}),
-        ]),
-    ])
-
-
-def _rag_panel():
-    return html.Div(id="rag-panel", style={
-        "width": "300px", "minWidth": "300px",
-        "backgroundColor": C["surface"],
-        "borderLeft": f"1px solid {C['border']}",
-        "display": "flex", "flexDirection": "column", "height": "100%",
-    }, children=[
-        html.Div(style={
-            "padding": "14px 16px", "borderBottom": f"1px solid {C['border']}",
-            "display": "flex", "alignItems": "center", "justifyContent": "space-between",
-        }, children=[
-            html.Div(style={"display": "flex", "alignItems": "center", "gap": "8px"}, children=[
-                html.Div("⚡", style={
-                    "width": "26px", "height": "26px", "borderRadius": "6px",
-                    "background": f"linear-gradient(135deg, {C['accent']}, {C['blue']})",
-                    "display": "flex", "alignItems": "center", "justifyContent": "center",
-                    "fontSize": "13px",
-                }),
-                html.Span("EXPLICATION IA (RAG)", style={
-                    "fontSize": "10px", "fontWeight": "700", "color": C["text"],
-                    "letterSpacing": "0.08em", "fontFamily": "'Space Mono', monospace",
-                }),
-            ]),
-        ]),
-        html.Div(id="rag-content", style={"flex": "1", "overflow": "auto", "padding": "16px"},
-                 children=_rag_empty()),
-    ])
-
-
-def _rag_empty():
-    return html.Div(style={
-        "display": "flex", "flexDirection": "column",
-        "alignItems": "center", "justifyContent": "center",
-        "height": "100%", "color": C["muted"], "textAlign": "center",
-    }, children=[
-        html.Div("⚡", style={"fontSize": "32px", "marginBottom": "12px", "opacity": "0.3"}),
-        html.P("Sélectionnez un log dans le tableau pour voir l'analyse IA",
-               style={"fontSize": "12px", "lineHeight": "1.6",
-                      "fontFamily": "'DM Sans', sans-serif"}),
-    ])
-
-
-def _rag_card(row):
-    is_anomaly = row.get("Statut") == "ANOMALIE"
-    score = float(row.get("Score IA", 0))
-    return html.Div(style={"fontFamily": "'DM Sans', sans-serif"}, children=[
-        # Description
-        html.Div(style={"marginBottom": "14px"}, children=[
-            html.Div("DESCRIPTION DU LOG SÉLECTIONNÉ", style={
-                "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.1em",
-                "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                "marginBottom": "8px",
-            }),
-            html.Div(style={
-                "backgroundColor": C["surface2"], "border": f"1px solid {C['border2']}",
-                "borderRadius": "6px", "padding": "10px 12px",
-                "fontSize": "12px", "color": C["text"], "lineHeight": "1.6",
-            }, children=row.get("Message", "—")[:150]),
-        ]),
-        # Score bar
-        html.Div(style={"marginBottom": "14px"}, children=[
-            html.Div(style={"display": "flex", "justifyContent": "space-between", "marginBottom": "6px"}, children=[
-                html.Span("Score IA", style={"fontSize": "11px", "color": C["muted2"]}),
-                html.Span(f"{score:.2f}", style={
-                    "fontSize": "11px", "fontWeight": "700",
-                    "color": C["danger"] if is_anomaly else C["success"],
-                    "fontFamily": "'Space Mono', monospace",
-                }),
-            ]),
-            html.Div(style={
-                "height": "4px", "backgroundColor": C["border2"],
-                "borderRadius": "2px", "overflow": "hidden",
-            }, children=[
-                html.Div(style={
-                    "height": "100%", "width": f"{min(score * 100, 100):.0f}%",
-                    "background": f"linear-gradient(90deg, {C['blue']}, {C['danger'] if is_anomaly else C['success']})",
-                    "borderRadius": "2px",
-                }),
-            ]),
-        ]),
-        # Analysis
-        html.Div(style={"marginBottom": "14px"}, children=[
-            html.Div("ANALYSE DU MODÈLE RAG", style={
-                "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.1em",
-                "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                "marginBottom": "8px",
-            }),
-            html.Div(style={
-                "backgroundColor": C["surface2"],
-                "border": f"1px solid {'rgba(239,68,68,0.25)' if is_anomaly else C['border2']}",
-                "borderRadius": "6px", "padding": "10px 12px 10px 18px",
-                "fontSize": "12px", "color": C["text"], "lineHeight": "1.7",
-                "borderLeft": f"3px solid {C['danger'] if is_anomaly else C['success']}",
-            }, children=(
-                f"Ce log indique une tentative d'injection SQL sur le port 80. "
-                f"Score d'anomalie élevé ({score:.2f}/1.0). "
-                f"Pattern récurrent détecté sur le service {row.get('Source', 'inconnu')}."
-            ) if is_anomaly else (
-                f"Log de routine — comportement nominal détecté. "
-                f"Score {score:.2f} en dessous du seuil d'alerte. Aucune action requise."
-            )),
-        ]),
-        # Action
-        html.Div(children=[
-            html.Div("ACTION SUGGÉRÉE", style={
-                "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.1em",
-                "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                "marginBottom": "8px",
-            }),
-            html.Div(style={
-                "background": f"linear-gradient(135deg, {C['accent']}22, {C['blue']}22)",
-                "border": f"1px solid {C['accent']}44",
-                "borderRadius": "6px", "padding": "10px 12px",
-            }, children=[
-                html.Span(
-                    "🔄 RESTART DU POD RECOMMANDÉ" if is_anomaly else "✅ AUCUNE ACTION REQUISE",
-                    style={
-                        "fontSize": "11px", "fontWeight": "700", "color": C["text"],
-                        "letterSpacing": "0.04em", "fontFamily": "'Space Mono', monospace",
-                    }
-                ),
-                html.P(
-                    "Lien direct vers l'action Kubernetes" if is_anomaly else "Continuer la surveillance normale",
-                    style={"fontSize": "11px", "color": C["muted2"], "marginTop": "4px"}
-                ),
-            ]),
-        ]),
-    ])
-
-
-def _page_logs():
-    return html.Div(style={
-        "flex": "1", "display": "flex", "flexDirection": "column",
-        "overflow": "hidden", "minWidth": "0",
-    }, children=[
-        _topbar("HISTORIQUE DES LOGS", "(Spark Streaming)"),
-
-        # Metrics mini bar
-        html.Div(id="metrics-bar", style={
-            "display": "flex", "gap": "20px", "alignItems": "center",
-            "padding": "8px 20px",
-            "backgroundColor": C["surface2"],
-            "borderBottom": f"1px solid {C['border']}",
-            "flexShrink": "0",
-        }),
-
-        _filter_bar(),
-
-        html.Div(style={
-            "flex": "1", "display": "flex", "flexDirection": "row",
-            "overflow": "hidden", "minHeight": "0",
-        }, children=[
-            # Table
-            html.Div(style={"flex": "1", "overflow": "auto", "minWidth": "0"}, children=[
-                dash_table.DataTable(
-                    id="main-table",
-                    columns=[{"name": c, "id": c} for c in TABLE_COLS],
-                    data=[],
-                    style_table={"overflowX": "auto", "width": "100%"},
-                    style_header=_HEADER, style_cell=_CELL,
-                    style_cell_conditional=[
-                        {"if": {"column_id": "Message"}, "whiteSpace": "normal", "textOverflow": "clip", "maxWidth": "0"},
-                        {"if": {"column_id": "Timestamp"}, "width": "155px", "minWidth": "155px",
-                         "fontFamily": "'Space Mono', monospace", "fontSize": "11px", "color": C["muted2"]},
-                        {"if": {"column_id": "Source"}, "width": "160px", "minWidth": "120px",
-                         "color": C["cyan"], "fontFamily": "'Space Mono', monospace", "fontSize": "11px"},
-                        {"if": {"column_id": "Score IA"}, "width": "80px", "minWidth": "80px",
-                         "textAlign": "center", "fontFamily": "'Space Mono', monospace", "fontWeight": "700"},
-                        {"if": {"column_id": "Statut"}, "width": "110px", "minWidth": "110px", "textAlign": "center"},
-                    ],
-                    style_data_conditional=[
-                        {"if": {"filter_query": '{Statut} = "ANOMALIE"', "column_id": "Statut"},
-                         "color": C["danger"], "fontWeight": "700",
-                         "fontFamily": "'Space Mono', monospace", "fontSize": "10px", "letterSpacing": "0.06em"},
-                        {"if": {"filter_query": '{Statut} = "NORMAL"', "column_id": "Statut"},
-                         "color": C["success"], "fontFamily": "'Space Mono', monospace",
-                         "fontSize": "10px", "letterSpacing": "0.06em"},
-                        {"if": {"filter_query": '{Statut} = "ANOMALIE"', "column_id": "Score IA"}, "color": C["danger"]},
-                        {"if": {"filter_query": '{Statut} = "NORMAL"', "column_id": "Score IA"}, "color": C["success"]},
-                        {"if": {"row_index": "odd"}, "backgroundColor": C["surface2"]},
-                    ],
-                    page_size=60, sort_action="native",
-                    row_selectable="single", selected_rows=[],
-                ),
-            ]),
-            _rag_panel(),
-        ]),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ALERTS PAGE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _page_alerts():
-    return html.Div(style={
-        "flex": "1", "display": "flex", "flexDirection": "column",
-        "overflow": "hidden", "minWidth": "0",
-    }, children=[
-        _topbar("ALERTES CRITIQUES", "Anomalies avec ratio > 1.3x uniquement"),
-
-        # Alert summary bar
-        html.Div(style={
-            "padding": "12px 20px",
-            "backgroundColor": "rgba(239,68,68,0.06)",
-            "borderBottom": f"1px solid rgba(239,68,68,0.2)",
-            "display": "flex", "alignItems": "center", "gap": "16px",
-            "flexShrink": "0",
-        }, children=[
-            html.Div(style={
-                "width": "10px", "height": "10px", "borderRadius": "50%",
-                "backgroundColor": C["danger"],
-                "boxShadow": f"0 0 8px {C['danger']}",
-            }, className="alert-pulse"),
-            html.Span(id="alert-summary", style={
-                "fontSize": "12px", "color": C["danger"],
-                "fontFamily": "'Space Mono', monospace", "fontWeight": "700",
-            }),
-            html.Span("—", style={"color": C["muted"]}),
-            html.Span(id="alert-last-seen", style={
-                "fontSize": "11px", "color": C["muted2"],
-                "fontFamily": "'Space Mono', monospace",
-            }),
-        ]),
-
-        # Alerts table
-        html.Div(style={"flex": "1", "overflow": "auto"}, children=[
-            dash_table.DataTable(
-                id="alert-table",
-                columns=[{"name": c, "id": c} for c in ALERT_TABLE_COLS],
-                data=[],
-                style_table={"overflowX": "auto", "width": "100%"},
-                style_header=_HEADER,
-                style_cell={**_CELL, "backgroundColor": "#0f0a0a"},
-                style_cell_conditional=[
-                    {"if": {"column_id": "Message"}, "whiteSpace": "normal", "textOverflow": "clip", "maxWidth": "0"},
-                    {"if": {"column_id": "Timestamp"}, "width": "155px", "minWidth": "155px",
-                     "fontFamily": "'Space Mono', monospace", "fontSize": "11px", "color": C["muted2"]},
-                    {"if": {"column_id": "Source"}, "width": "160px",
-                     "color": C["danger"], "fontFamily": "'Space Mono', monospace", "fontSize": "11px"},
-                    {"if": {"column_id": "Host"}, "width": "120px",
-                     "fontFamily": "'Space Mono', monospace", "fontSize": "11px"},
-                    {"if": {"column_id": "Score IA"}, "width": "80px", "textAlign": "center",
-                     "fontFamily": "'Space Mono', monospace", "fontWeight": "700", "color": C["danger"]},
-                    {"if": {"column_id": "Ratio"}, "width": "80px", "textAlign": "center",
-                     "fontFamily": "'Space Mono', monospace", "fontWeight": "700", "color": C["warning"]},
-                ],
-                style_data_conditional=[
-                    {"if": {"row_index": "odd"}, "backgroundColor": "#120a0a"},
-                ],
-                page_size=50, sort_action="native",
-            ),
-        ]),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ROOT LAYOUT
-# ─────────────────────────────────────────────────────────────────────────────
-
-app.layout = html.Div(style={
-    "backgroundColor": C["bg"], "height": "100vh",
-    "display": "flex", "flexDirection": "row",
-    "fontFamily": "'DM Sans', sans-serif", "color": C["text"],
-    "overflow": "hidden",
-}, children=[
-    # Sidebar — rebuilt via callback to update active state
-    html.Div(id="sidebar-container", style={"display": "flex"}),
-
-    # Page content
-    html.Div(id="page-content", style={
-        "flex": "1", "display": "flex", "overflow": "hidden", "minWidth": "0",
-    }),
-
-    # Stores & intervals
-    dcc.Interval(id="interval", interval=REFRESH_INTERVAL_MS, n_intervals=0),
-    dcc.Store(id="current-page", data="logs"),
-    dcc.Store(id="rows-store",   data=[]),
-    dcc.Store(id="selected-row-store", data=None),
-])
-
+def _rag_for(row):
+    if not row:
+        return {
+            "desc": "Sélectionnez un log dans le tableau.", "score": "—", "ratio": "—", "status": _badge("Aucun log", "#93c5fd", "rgba(147,197,253,.13)"),
+            "analysis": "L'analyse RAG apparaîtra ici dès qu'une ligne sera sélectionnée.",
+            "action": "Aucune action pour le moment.",
+        }
+    is_anom = row.get("Statut") == "ANOMALIE"
+    msg = row.get("Message", "—")
+    score = row.get("Score IA", "0.00")
+    ratio = row.get("Ratio", "0.00x")
+    src = row.get("Source", "unknown")
+    host = row.get("Host", "unknown")
+    if is_anom:
+        analysis = f"Le modèle classe ce log comme anomalie car son ratio de sévérité ({ratio}) dépasse le seuil configuré ({ALERT_THRESHOLD:.1f}x). Le service {src} sur l'hôte {host} présente un comportement inhabituel par rapport au profil appris."
+        action = "Action recommandée : inspecter le service, corréler avec les logs voisins, vérifier les accès récents et redémarrer le pod si l'erreur se répète."
+        status = _badge("ANOMALIE", "#fecaca", "rgba(220,38,38,.22)")
+    else:
+        analysis = f"Le log est considéré comme normal : le ratio {ratio} reste sous le seuil critique. Le score IA peut paraître élevé, mais la décision repose sur le ratio normalisé."
+        action = "Aucune action immédiate. Continuer la surveillance et conserver le log pour analyse historique."
+        status = _badge("NORMAL", "#bbf7d0", "rgba(34,197,94,.18)")
+    return {"desc": msg, "score": str(score), "ratio": str(ratio), "status": status, "analysis": analysis, "action": action}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CALLBACKS
 # ─────────────────────────────────────────────────────────────────────────────
-
 @app.callback(
     Output("current-page", "data"),
-    Input("nav-btn-dashboard", "n_clicks"),
-    Input("nav-btn-logs",      "n_clicks"),
-    Input("nav-btn-alerts",    "n_clicks"),
-    State("current-page", "data"),
-    prevent_initial_call=True,
+    Input("nav-dashboard", "n_clicks"), Input("nav-logs", "n_clicks"), Input("nav-alerts", "n_clicks"),
+    State("current-page", "data"), prevent_initial_call=True,
 )
-def navigate(n_dashboard, n_logs, n_alerts, current):
+def navigate(a, b, c, current):
     ctx = callback_context
     if not ctx.triggered:
         return current
-    btn_id = ctx.triggered[0]["prop_id"].split(".")[0]
-    mapping = {
-        "nav-btn-dashboard": "dashboard",
-        "nav-btn-logs":      "logs",
-        "nav-btn-alerts":    "alerts",
-    }
-    return mapping.get(btn_id, current)
-
-
-def _compute_dashboard_data():
-    with _lock:
-        rows  = list(_buffer)
-        total = _total_received
-
-    high_rows  = [r for r in rows if r.get("_ratio_val", 0) > 1.3]
-    scores     = [r.get("_score_val", 0) for r in rows if "_score_val" in r]
-    avg_score  = sum(scores) / len(scores) if scores else 0
-    services   = len({r["Source"] for r in high_rows if r.get("Source")})
-    rate       = len(high_rows)
-
-    health = [
-        _health_badge("Kafka Broker",       ok=True),
-        _health_badge("Kubernetes Cluster", ok=True),
-        _health_badge("ML Model API",       ok=total > 0),
-        _health_badge("Spark Streaming",    ok=total > 0),
-    ]
-
-    display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-
-    return {
-        "total":        str(total),
-        "high":         str(len(high_rows)),
-        "avg_score":    f"{avg_score:.3f}",
-        "rate":         str(rate),
-        "services":     str(services),
-        "fig_timeline": _anomaly_timeline_fig(display_rows),
-        "fig_score":    _score_timeline_fig(display_rows),
-        "fig_services": _services_fig(rows),
-        "health":       health,
-    }
+    return {"nav-dashboard": "dashboard", "nav-logs": "logs", "nav-alerts": "alerts"}.get(ctx.triggered[0]["prop_id"].split(".")[0], current)
 
 
 @app.callback(
-    Output("sidebar-container", "children"),
-    Output("page-content",      "children"),
+    Output("page-dashboard", "style"), Output("page-logs", "style"), Output("page-alerts", "style"),
     Input("current-page", "data"),
 )
-def render_page(page):
-    sidebar = _sidebar(active_page=page)
-    if page == "dashboard":
-        content = _page_dashboard(init_data=_compute_dashboard_data())
-    elif page == "alerts":
-        content = _page_alerts()
-    else:
-        content = _page_logs()
-    return sidebar, content
+def show_page(page):
+    base_visible = {"display": "block", "height": "100%", "overflow": "auto"}
+    logs_visible = {"display": "block", "height": "100%", "overflow": "hidden"}
+    hidden = {"display": "none"}
+    return (base_visible if page == "dashboard" else hidden,
+            logs_visible if page == "logs" else hidden,
+            base_visible if page == "alerts" else hidden)
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _apply_filters(rows, search_text, source_filter, level_filter, limit_filter):
-    search_text  = (search_text or "").lower().strip()
-    level_filter = level_filter or "all"
-    limit_filter = int(limit_filter or 200)
-    filtered = []
-    for r in rows:
-        searchable = " ".join([r.get("Timestamp",""), r.get("Source",""),
-                               r.get("Message",""), r.get("Score IA","")]).lower()
-        if search_text and search_text not in searchable:
-            continue
-        if source_filter and r.get("Source") != source_filter:
-            continue
-        if level_filter == "high"   and r.get("_ratio_val", 0) <= 1.3: continue
-        if level_filter == "normal" and r.get("_ratio_val", 0) >  1.3: continue
-        filtered.append(r)
-    return filtered[:limit_filter]
-
-
-def _mini_metric(label, value, color=None):
-    return html.Div(style={"textAlign": "center"}, children=[
-        html.Div(value, style={
-            "fontSize": "18px", "fontWeight": "700",
-            "color": color or C["text"], "fontFamily": "'Space Mono', monospace",
-        }),
-        html.Div(label, style={
-            "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.08em",
-            "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-        }),
-    ])
-
-
-# ── Logs page callbacks ───────────────────────────────────────────────────────
 
 @app.callback(
-    Output("metrics-bar",   "children"),
-    Output("time-display",  "children"),
-    Output("main-table",    "data"),
+    Output("clock", "children"),
+    Input("interval", "n_intervals"),
+)
+def tick(_):
+    return datetime.now().strftime("%A %d %B %Y • %H:%M:%S").upper()
+
+
+@app.callback(
+    Output("metrics", "data", allow_duplicate=True) if False else Output("m-total", "children"),
+    Output("m-anom", "children"), Output("m-score", "children"), Output("m-sources", "children"), Output("m-risk", "children"),
+    Output("fig-stream", "figure"), Output("fig-risk", "figure"), Output("fig-services", "figure"), Output("fig-score", "figure"), Output("ai-briefing", "children"),
+    Input("interval", "n_intervals"),
+)
+def update_dashboard(_):
+    rows, total = _visible_rows()
+    anom = [r for r in rows if r.get("Statut") == "ANOMALIE"]
+    avg = sum(r.get("_score_val", 0) for r in rows) / max(1, len(rows))
+    sources = len({r.get("Source") for r in anom if r.get("Source")})
+    risk = round(len(anom) / max(1, len(rows)) * 100, 1) if rows else 0
+    return str(total), str(len(anom)), f"{avg:.2f}", str(sources), f"{risk}%", _stream_fig(rows), _risk_fig(rows), _services_fig(rows), _score_fig(rows), _ai_briefing(rows)
+
+@app.callback(
+    Output("main-table", "data"),
     Output("source-filter", "options"),
-    Output("rows-store",    "data"),
-    Input("interval",       "n_intervals"),
-    Input("search-text",    "value"),
-    Input("source-filter",  "value"),
-    Input("level-filter",   "value"),
-    Input("limit-filter",   "value"),
-    prevent_initial_call=False,
-)
-def refresh_logs(_, search_text, source_filter, level_filter, limit_filter):
-    with _lock:
-        rows  = [r for r in _buffer if "_ratio_val" in r]
-        total = _total_received
-
-    source_options = [{"label": s, "value": s}
-                      for s in sorted({r["Source"] for r in rows if r.get("Source")})]
-
-    filtered     = _apply_filters(rows, search_text, source_filter, level_filter, limit_filter)
-    high_count   = sum(1 for r in filtered if r.get("_ratio_val", 0) > 1.3)
-    sources_count = len({r["Source"] for r in filtered}) if filtered else 0
-    display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in filtered]
-
-    metrics = [
-        _mini_metric("Total",     str(total)),
-        html.Div(style={"width":"1px","backgroundColor":C["border"],"margin":"0 4px"}),
-        _mini_metric("Anomalies", str(high_count),    C["danger"] if high_count else C["muted"]),
-        html.Div(style={"width":"1px","backgroundColor":C["border"],"margin":"0 4px"}),
-        _mini_metric("Sources",   str(sources_count)),
-        html.Div(style={"width":"1px","backgroundColor":C["border"],"margin":"0 4px"}),
-        _mini_metric("Topic",     KAFKA_TOPIC[:14],   C["muted"]),
-    ]
-
-    store_rows = [{k: v for k, v in r.items() if k != "_seq"} for r in filtered]
-    now_time   = datetime.now().strftime("%H:%M:%S")
-    return metrics, now_time, display_rows, source_options, store_rows
-
-
-@app.callback(
-    Output("main-table", "selected_rows"),
-    Input("main-table",  "selected_rows"),
-    State("selected-row-store", "data"),
-    prevent_initial_call=True,
-)
-def preserve_selection(selected_rows, stored):
-    if selected_rows:
-        return selected_rows
-    if stored is not None:
-        return [stored]
-    return []
-
-
-@app.callback(
-    Output("selected-row-store", "data"),
-    Input("main-table", "selected_rows"),
-    prevent_initial_call=True,
-)
-def save_selection(selected_rows):
-    if selected_rows:
-        return selected_rows[0]
-    return dash.no_update
-
-
-@app.callback(
-    Output("rag-content", "children"),
-    Input("main-table",   "selected_rows"),
-    State("rows-store",   "data"),
-)
-def show_rag(selected_rows, store_data):
-    if not selected_rows or not store_data:
-        return _rag_empty()
-    idx = selected_rows[0]
-    if idx >= len(store_data):
-        return html.P("Données non disponibles.", style={"color": C["muted"], "fontSize": "12px"})
-    return _rag_card(store_data[idx])
-
-
-# ── Dashboard callbacks ───────────────────────────────────────────────────────
-@app.callback(
-    Output("kpi-total",     "children"),
-    Output("kpi-high",      "children"),
-    Output("kpi-avg-score", "children"),
-    Output("kpi-rate",      "children"),
-    Output("kpi-services",  "children"),
-    Output("graph-timeline","figure"),
-    Output("graph-score",   "figure"),
-    Output("graph-services","figure"),
-    Output("health-panel",  "children"),
+    Output("rows-store", "data"),
+    Output("logs-count", "children"),
     Input("interval", "n_intervals"),
-    State("current-page", "data"),
+    Input("current-page", "data"),
+    Input("search-text", "value"),
+    Input("source-filter", "value"),
+    Input("level-filter", "value"),
+    Input("limit-filter", "value"),
 )
-def refresh_dashboard(_, page):
-    if page != "dashboard":
-        raise dash.exceptions.PreventUpdate
+def update_logs(_, page, search, source, level, limit):
+    rows, _total = _visible_rows()
 
-    d = _compute_dashboard_data()
-    return (
-        d["total"], d["high"], d["avg_score"], d["rate"], d["services"],
-        d["fig_timeline"], d["fig_score"], d["fig_services"], d["health"],
-    )
+    # sécurité : si pas de page ou filtre vide
+    level = level or "all"
+    limit = int(limit or 200)
+
+    filtered = _filter_rows(rows, search, source, level, limit)
+
+    source_values = sorted({
+        r.get("Source")
+        for r in rows
+        if r.get("Source")
+    })
+
+    options = [{"label": s, "value": s} for s in source_values]
+
+    table_rows = []
+    for r in filtered:
+        table_rows.append({
+            "id": r.get("id"),
+            "Timestamp": r.get("Timestamp", ""),
+            "Source": r.get("Source", ""),
+            "Host": r.get("Host", ""),
+            "Message": r.get("Message", ""),
+            "Score IA": r.get("Score IA", ""),
+            "Ratio": r.get("Ratio", ""),
+            "Statut": r.get("Statut", ""),
+        })
+
+    return table_rows, options, table_rows, f"{len(filtered)} / {len(rows)} logs"
+
 # @app.callback(
-#     Output("kpi-total",     "children"),
-#     Output("kpi-high",      "children"),
-#     Output("kpi-avg-score", "children"),
-#     Output("kpi-rate",      "children"),
-#     Output("kpi-services",  "children"),
-#     Output("graph-timeline","figure"),
-#     Output("graph-score",   "figure"),
-#     Output("graph-services","figure"),
-#     Output("health-panel",  "children"),
+#     Output("main-table", "data"),
+#     Output("source-filter", "options"),
+#     Output("rows-store", "data"),
+#     Output("logs-count", "children"),
 #     Input("interval", "n_intervals"),
+#     Input("current-page", "data"),
+#     Input("search-text", "value"),
+#     Input("source-filter", "value"),
+#     Input("level-filter", "value"),
+#     Input("limit-filter", "value"),
 # )
-# def refresh_dashboard(_):
-#     with _lock:
-#         rows  = list(_buffer)
-#         total = _total_received
-
-#     high_rows   = [r for r in rows if r.get("_ratio_val", 0) > 1.3]
-#     scores      = [r.get("_score_val", 0) for r in rows if "_score_val" in r]
-#     avg_score   = sum(scores) / len(scores) if scores else 0
-#     services    = len({r["Source"] for r in high_rows if r.get("Source")})
-
-#     # Anomalies per minute (last 5 min)
-#     now  = datetime.now()
-#     rate = sum(1 for r in rows if r.get("_ratio_val", 0) > 1.3 and _within_minutes(r, now, 1))
-
-#     health = [
-#         _health_badge("Kafka Broker",      ok=True),
-#         _health_badge("Kubernetes Cluster",ok=True),
-#         _health_badge("ML Model API",      ok=total > 0),
-#         _health_badge("Spark Streaming",   ok=total > 0),
-#     ]
-
-#     display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-
-#     return (
-#         str(total),
-#         str(len(high_rows)),
-#         f"{avg_score:.3f}",
-#         f"{rate}/min",
-#         str(services),
-#         _anomaly_timeline_fig(display_rows),
-#         _score_timeline_fig(display_rows),
-#         _services_fig(rows),
-#         health,
-#     )
-
-
-def _within_minutes(row, now, minutes):
-    try:
-        ts = datetime.strptime(row["Timestamp"], "%Y-%m-%d %H:%M:%S")
-        return (now - ts).total_seconds() <= minutes * 60
-    except Exception:
-        return False
-
-
-# ── Alerts callbacks ──────────────────────────────────────────────────────────
+# def update_logs(_, page, search, source, level, limit):
+#     rows, _total = _visible_rows()
+#     filtered = _filter_rows(rows, search, source, level, limit)
+#     options = [{"label": s, "value": s} for s in sorted({r.get("Source") for r in rows if r.get("Source")})]
+#     return [_display_row(r) for r in filtered], options, filtered, f"{len(filtered)} / {len(rows)} logs"
+# @app.callback(
+#     Output("main-table", "data"), Output("source-filter", "options"), Output("rows-store", "data"), Output("logs-count", "children"),
+#     Input("interval", "n_intervals"), Input("search-text", "value"), Input("source-filter", "value"), Input("level-filter", "value"), Input("limit-filter", "value"),
+# )
+# def update_logs(_, search, source, level, limit):
+#     rows, _total = _visible_rows()
+#     filtered = _filter_rows(rows, search, source, level, limit)
+#     options = [{"label": s, "value": s} for s in sorted({r.get("Source") for r in rows if r.get("Source")})]
+#     return [_display_row(r) for r in filtered], options, filtered, f"{len(filtered)} / {len(rows)} logs"
 
 @app.callback(
-    Output("alert-table",    "data"),
-    Output("alert-summary",  "children"),
-    Output("alert-last-seen","children"),
+    Output("selected-log-store", "data"),
+    Input("main-table", "active_cell"),
+    State("main-table", "data"),
+    prevent_initial_call=True,
+)
+def store_selected(active_cell, table_data):
+    if not active_cell or not table_data:
+        return None
+
+    row_index = active_cell.get("row")
+
+    if row_index is None or row_index >= len(table_data):
+        return None
+
+    return table_data[row_index]
+
+# @app.callback(
+#     Output("selected-log-store", "data"),
+#     Input("main-table", "selected_row_ids"), State("rows-store", "data"), prevent_initial_call=True,
+# )
+# def store_selected(row_ids, rows):
+#     if not row_ids or not rows:
+#         return None
+#     selected_id = row_ids[0]
+#     return next((r for r in rows if r.get("id") == selected_id), None)
+
+
+@app.callback(
+    Output("rag-desc", "children"), Output("rag-score", "children"), Output("rag-ratio", "children"),
+    Output("rag-status-chip", "children"), Output("rag-analysis", "children"), Output("rag-action", "children"), Output("feedback-status", "children"),
+    Input("selected-log-store", "data"),
+)
+def render_rag(row):
+    r = _rag_for(row)
+    return r["desc"], r["score"], r["ratio"], r["status"], r["analysis"], r["action"], "Le feedback sera sauvegardé pour évaluer le RAG."
+
+
+@app.callback(
+    Output("feedback-status", "children", allow_duplicate=True),
+    Input("fb-up", "n_clicks"), Input("fb-down", "n_clicks"), State("selected-log-store", "data"), prevent_initial_call=True,
+)
+def save_feedback(up, down, row):
+    if not row:
+        return "Sélectionne d'abord un log avant de donner un feedback."
+    ctx = callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+    trigger = ctx.triggered[0]["prop_id"].split(".")[0]
+    feedback = "positive" if trigger == "fb-up" else "negative"
+    record = {
+        "timestamp": datetime.now().isoformat(), "feedback": feedback,
+        "log_id": row.get("id"), "source": row.get("Source"), "host": row.get("Host"),
+        "message": row.get("Message"), "score_ia": row.get("Score IA"), "ratio": row.get("Ratio"), "statut": row.get("Statut"),
+    }
+    try:
+        os.makedirs(os.path.dirname(FEEDBACK_PATH), exist_ok=True)
+        with open(FEEDBACK_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return "✅ Feedback enregistré pour l'évaluation du RAG."
+    except Exception as e:
+        return f"⚠️ Feedback non sauvegardé : {e}"
+
+
+@app.callback(
+    Output("alert-table", "data"), Output("alert-strip", "children"),
     Input("interval", "n_intervals"),
 )
-def refresh_alerts(_):
-    with _lock:
-        rows = list(_buffer)
+def update_alerts(_):
+    rows, _ = _visible_rows()
+    critical = [r for r in rows if r.get("_ratio_val", 0) > ALERT_THRESHOLD]
+    strip = html.Div(style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr", "gap": "14px"}, children=[
+        _metric_card("alertes critiques", "alert-dummy-1", T["red"], "🚨", "ACTIVE"),
+        _metric_card("dernier événement", "alert-dummy-2", T["orange"], "⏱", "LAST"),
+        _metric_card("source principale", "alert-dummy-3", T["cyan"], "🖥", "TOP"),
+    ])
+    # Fill static IDs inside dynamic strip is problematic if callbacks target them; no callbacks target them.
+    last = critical[0].get("Timestamp", "—") if critical else "—"
+    top = Counter(r.get("Source", "unknown") for r in critical).most_common(1)
+    top_src = top[0][0] if top else "—"
+    strip.children[0].children[1].children = str(len(critical))
+    strip.children[1].children[1].children = last[-8:] if last != "—" else "—"
+    strip.children[2].children[1].children = top_src
+    return [_display_row(r, include_model=True) for r in critical], strip
 
-    critical = [r for r in rows if r.get("_ratio_val", 0) > 1.3]
 
-    alert_rows = [{
-        "Timestamp": r.get("Timestamp", ""),
-        "Source":    r.get("Source", ""),
-        "Host":      r.get("Host", ""),
-        "Message":   r.get("Message", ""),
-        "Score IA":  r.get("Score IA", ""),
-        "Ratio":     r.get("Ratio", ""),
-    } for r in critical]
-
-    summary   = f"{len(critical)} ALERTE(S) CRITIQUE(S) ACTIVE(S)"
-    last_seen = f"Dernier événement : {critical[0]['Timestamp'] if critical else '—'}"
-    return alert_rows, summary, last_seen
 
 
 if __name__ == "__main__":
