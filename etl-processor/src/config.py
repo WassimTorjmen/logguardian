@@ -14,10 +14,9 @@ KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "etl-processor")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
 BATCH_TIMEOUT_SEC = int(os.getenv("BATCH_TIMEOUT_SEC", "30"))
 
-# S3
-S3_BUCKET = os.getenv("S3_BUCKET", "logguardian-datalake-148761640356")
-S3_PREFIX = os.getenv("S3_PREFIX", "logs")
-AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
+# GCS
+GCS_BUCKET = os.getenv("GCS_BUCKET", "logguardian-datalake-logguardian-497218")
+GCS_PREFIX = os.getenv("GCS_PREFIX", "logs")
 
 # Mode local : si True, ecrit les Parquet en local au lieu de S3
 LOCAL_MODE = os.getenv("LOCAL_MODE", "false").lower() == "true"

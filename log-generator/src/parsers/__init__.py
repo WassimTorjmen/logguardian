@@ -4,6 +4,7 @@ from .hadoop_parser import HadoopParser
 from .spark_parser import SparkParser
 from .supercomputer_parser import SupercomputerParser
 from .hdfs_parser import HDFSParser
+from .android_parser import AndroidParser
 
 ALL_PARSERS = {
     "linux": LinuxParser,
@@ -12,4 +13,5 @@ ALL_PARSERS = {
     "spark": SparkParser,
     "supercomputer": SupercomputerParser,
     "hdfs": HDFSParser,
+    "android": AndroidParser,
 }

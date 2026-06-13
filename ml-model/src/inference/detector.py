@@ -6,9 +6,9 @@ import logging
 import os
 import pickle
 
-import boto3
 import numpy as np
 import torch
+from google.cloud import storage as gcs
 
 from trainer.features import log_to_vector
 from trainer.model import LSTMAutoencoder
@@ -74,10 +74,11 @@ class AnomalyDetector:
         return f"lstm_v1_{self.meta['computed_at'][:10].replace('-', '')}"
 
 
-def download_models_from_s3(bucket: str, model_dir: str, region: str):
-    """Télécharge les artefacts depuis S3 au démarrage du pod."""
+def download_models_from_gcs(bucket: str, model_dir: str):
+    """Télécharge les artefacts depuis GCS au démarrage du pod (Workload Identity)."""
     os.makedirs(model_dir, exist_ok=True)
-    s3 = boto3.client("s3", region_name=region)
+    client = gcs.Client()
+    gcs_bucket = client.bucket(bucket)
     artifacts = [
         "lstm_autoencoder.pt",
         "vocabulary.pkl",
@@ -87,6 +88,6 @@ def download_models_from_s3(bucket: str, model_dir: str, region: str):
     ]
     for name in artifacts:
         dest = os.path.join(model_dir, name)
-        log.info("Téléchargement s3://%s/%s → %s", bucket, name, dest)
-        s3.download_file(bucket, name, dest)
-    log.info("Artefacts téléchargés depuis S3.")
+        log.info("Téléchargement gs://%s/%s → %s", bucket, name, dest)
+        gcs_bucket.blob(name).download_to_filename(dest)
+    log.info("Artefacts téléchargés depuis GCS.")

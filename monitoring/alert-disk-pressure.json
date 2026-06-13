@@ -1,0 +1,25 @@
+{
+  "displayName": "LogGuardian - Node DiskPressure",
+  "conditions": [
+    {
+      "displayName": "Node disk usage > 85%",
+      "conditionThreshold": {
+        "filter": "resource.type=\"k8s_node\" AND metric.type=\"kubernetes.io/node/ephemeral_storage/used_bytes\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_MEAN"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 9116319744,
+        "duration": "120s"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "604800s"
+  },
+  "combiner": "OR",
+  "enabled": true
+}
