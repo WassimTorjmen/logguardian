@@ -1,3 +1,11 @@
+# Modèles ML (fichiers lourds → stockés sur GCS)
+*.pt
+*.pkl
+*.npy
+
+# Fichiers système Mac
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

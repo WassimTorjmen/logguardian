@@ -40,6 +40,8 @@ class AnomalyDetector:
             hidden_size=self.meta["hidden_size"],
             latent_size=self.meta["latent_size"],
             seq_len=self.meta["seq_len"],
+            num_layers=self.meta.get("num_layers", 2),
+            dropout=self.meta.get("dropout", 0.2),
         ).to(self.device)
         self.model.load_state_dict(
             torch.load(
