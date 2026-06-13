@@ -1,14 +1,15 @@
 {
-  "threshold": 0.5,
-  "percentile": 50,
-  "computed_at": "2026-05-01T14:43:59.492389+00:00",
-  "n_samples": 4371,
+  "threshold": 0.4528014361858368,
+  "percentile": 95,
+  "computed_at": "2026-06-13T19:12:58.645917+00:00",
+  "n_samples": 73564,
   "n_features": 77,
   "seq_len": 10,
   "hidden_size": 64,
   "latent_size": 32,
   "vocab_size": 5000,
   "embed_dim": 64,
-  "train_loss": 0.2695526205492716,
-  "val_loss": 0.2640673196402149
+  "train_loss": 0.12656820965132776,
+  "val_loss": 0.10728766990420611,
+  "best_val_loss": 0.10728766990420611
 }
