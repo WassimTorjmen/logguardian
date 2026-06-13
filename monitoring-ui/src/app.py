@@ -20,6 +20,7 @@ MAX_ROWS                = int(os.getenv("MAX_ROWS", "2000"))
 REFRESH_INTERVAL_MS     = int(os.getenv("REFRESH_INTERVAL_MS", "3000"))
 
 _buffer: deque = deque(maxlen=MAX_ROWS)
+_seen: set = set()
 _lock = threading.Lock()
 _total_received = 0
 
@@ -43,19 +44,32 @@ def _kafka_thread():
         try:
             global _total_received
             r = json.loads(msg.value().decode("utf-8"))
-            row = {
-                "Timestamp":  r.get("detected_at", "")[:19].replace("T", " "),
-                "Source":     r.get("source", ""),
-                "Host":       r.get("host", ""),
-                "Message":    r.get("sequence", [{}])[-1].get("message", "")[:120],
-                "Score IA":   f"{r.get('anomaly_score', 0):.2f}",
-                "Ratio":      f"{r.get('severity_ratio', 0):.2f}x",
-                "Statut":     "ANOMALIE" if r.get("severity_ratio", 0) > 1.3 else "NORMAL",
-                "_ratio_val": r.get("severity_ratio", 0),
-                "_score_val": r.get("anomaly_score", 0),
-                "_ts":        r.get("detected_at", ""),
-            }
+            dedup_key = (
+                r.get("detected_at", "")[:19],
+                r.get("source", ""),
+                r.get("host", ""),
+                f"{r.get('anomaly_score', 0):.4f}",
+            )
             with _lock:
+                if dedup_key in _seen:
+                    log.debug("Message dupliqué ignoré : %s", dedup_key)
+                    continue
+                row = {
+                    "Timestamp":  r.get("detected_at", "")[:19].replace("T", " "),
+                    "Source":     r.get("source", ""),
+                    "Host":       r.get("host", ""),
+                    "Message":    r.get("sequence", [{}])[-1].get("message", "")[:120],
+                    "Score IA":   f"{r.get('anomaly_score', 0):.2f}",
+                    "Ratio":      f"{r.get('severity_ratio', 0):.2f}x",
+                    "Statut":     "ANOMALIE" if r.get("severity_ratio", 0) > 1.3 else "NORMAL",
+                    "_ratio_val": r.get("severity_ratio", 0),
+                    "_score_val": r.get("anomaly_score", 0),
+                    "_ts":        r.get("detected_at", ""),
+                }
+                _seen.add(dedup_key)
+                if len(_seen) > MAX_ROWS * 2:
+                    for _ in range(MAX_ROWS):
+                        _seen.pop()
                 _buffer.appendleft(row)
                 _total_received += 1
         except Exception as e:

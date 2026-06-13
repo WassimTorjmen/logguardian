@@ -4,7 +4,7 @@ metadata:
   name: etl-processor
   namespace: logguardian
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::148761640356:role/LogGuardianETLProcessorRole
+    iam.gke.io/gcp-service-account: terraform-sa@logguardian-497218.iam.gserviceaccount.com
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -20,9 +20,8 @@ data:
   BATCH_SIZE: "500"
   BATCH_TIMEOUT_SEC: "30"
   LOCAL_MODE: "false"
-  S3_BUCKET: logguardian-datalake-148761640356
-  S3_PREFIX: logs
-  AWS_REGION: eu-west-1
+  GCS_BUCKET: logguardian-datalake-logguardian-497218
+  GCS_PREFIX: logs
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -42,7 +41,7 @@ spec:
       serviceAccountName: etl-processor
       containers:
         - name: etl-processor
-          image: 148761640356.dkr.ecr.eu-west-1.amazonaws.com/logguardian/etl-processor:latest
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/etl-processor:aef6afe
           imagePullPolicy: Always
           envFrom:
             - configMapRef:

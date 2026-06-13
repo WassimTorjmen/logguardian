@@ -1,0 +1,50 @@
+steps:
+  # Étape 1 : Build + Push des images modifiées (avec cache depuis Artifact Registry)
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-and-push'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        registry=europe-west1-docker.pkg.dev/$PROJECT_ID/logguardian
+        for service in log-generator etl-processor ml-model monitoring-ui; do
+          if [ -f "$service/Dockerfile" ]; then
+            echo "Building $service..."
+            docker pull $registry/$service:latest || true
+            docker build \
+              --cache-from $registry/$service:latest \
+              -t $registry/$service:$SHORT_SHA \
+              -t $registry/$service:latest \
+              ./$service
+            docker push $registry/$service:$SHORT_SHA
+            docker push $registry/$service:latest
+            echo "Done $service"
+          else
+            echo "Skipping $service (no Dockerfile)"
+          fi
+        done
+
+  # Étape 2 : Authentification GKE + Mise à jour des deployments
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-to-gke'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud container clusters get-credentials logguardian \
+          --zone=europe-west1-b \
+          --project=$PROJECT_ID
+        for service in log-generator etl-processor ml-model monitoring-ui; do
+          if [ -f "$service/Dockerfile" ]; then
+            echo "Updating deployment/$service on GKE..."
+            kubectl set image deployment/$service \
+              $service=europe-west1-docker.pkg.dev/$PROJECT_ID/logguardian/$service:$SHORT_SHA \
+              -n logguardian || echo "Deployment $service not found, skipping"
+          fi
+        done
+
+substitutions:
+  _REGION: europe-west1
+
+options:
+  logging: CLOUD_LOGGING_ONLY

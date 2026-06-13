@@ -27,7 +27,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: monitoring-ui
-          image: 148761640356.dkr.ecr.eu-west-1.amazonaws.com/logguardian/monitoring-ui:latest
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/monitoring-ui:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8050
@@ -54,7 +54,7 @@ metadata:
   name: monitoring-ui
   namespace: logguardian
   annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    cloud.google.com/load-balancer-type: "External"
 spec:
   type: LoadBalancer
   selector:
