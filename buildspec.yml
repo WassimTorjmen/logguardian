@@ -23,6 +23,7 @@ phases:
             echo "Building $service..."
             docker build -t $IMAGE_REPO_PREFIX/$service:$IMAGE_TAG ./$service
             docker tag $IMAGE_REPO_PREFIX/$service:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX/$service:$IMAGE_TAG
+            docker tag $IMAGE_REPO_PREFIX/$service:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX/$service:latest
           else
             echo "Skipping $service (no Dockerfile)"
           fi
@@ -36,6 +37,7 @@ phases:
           if [ -f "$service/Dockerfile" ]; then
             echo "Pushing $service..."
             docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX/$service:$IMAGE_TAG
+            docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX/$service:latest
           fi
         done
       - echo Build completed on $(date)

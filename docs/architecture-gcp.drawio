@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+  <root>
+    <mxCell id="0" />
+    <mxCell id="1" parent="0" />
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- GCP PROJECT (border externe)                        -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="2" value="GCP Project — logguardian-497218" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];shape=mxgraph.gcp2.project;whiteSpace=wrap;fillColor=#E3F2FD;strokeColor=#1565C0;fontStyle=1;fontSize=13;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="40" y="20" width="1200" height="760" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- OBSERVABILITE (haut droite)                         -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="obs_box" value="Observabilité" style="rounded=1;whiteSpace=wrap;fillColor=#FCE4EC;strokeColor=#C62828;fontStyle=1;fontSize=11;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1100" y="30" width="230" height="120" as="geometry" />
+    </mxCell>
+    <mxCell id="monitoring" value="Cloud Monitoring" style="shape=mxgraph.gcp2.cloud_monitoring;fillColor=#4285F4;strokeColor=none;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1110" y="60" width="50" height="50" as="geometry" />
+    </mxCell>
+    <mxCell id="logging" value="Cloud Logging" style="shape=mxgraph.gcp2.cloud_logging;fillColor=#4285F4;strokeColor=none;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1230" y="60" width="50" height="50" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- VPC NETWORK                                          -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="vpc" value="VPC Network" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];shape=mxgraph.gcp2.virtual_private_cloud_vpc_;whiteSpace=wrap;fillColor=#E8F5E9;strokeColor=#2E7D32;fontStyle=1;fontSize=11;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="70" y="100" width="1140" height="580" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- SUBNET PRIVE                                         -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="subnet_private" value="Subnet Privé" style="rounded=1;whiteSpace=wrap;fillColor=#E8EAF6;strokeColor=#3949AB;fontStyle=1;fontSize=10;verticalAlign=top;dashed=1;" vertex="1" parent="1">
+      <mxGeometry x="90" y="150" width="870" height="490" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- GKE CLUSTER                                          -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="gke_box" value="Google Kubernetes Engine" style="rounded=1;whiteSpace=wrap;fillColor=#E3F2FD;strokeColor=#1565C0;fontStyle=1;fontSize=11;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="110" y="200" width="830" height="400" as="geometry" />
+    </mxCell>
+    <mxCell id="gke_icon" value="" style="shape=mxgraph.gcp2.google_kubernetes_engine;fillColor=#4285F4;strokeColor=none;" vertex="1" parent="1">
+      <mxGeometry x="130" y="215" width="30" height="30" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- PODS DANS GKE                                        -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- Log Generator -->
+    <mxCell id="pod_lg" value="Générateur&#xa;de logs" style="shape=mxgraph.kubernetes.pod;fillColor=#4FC3F7;strokeColor=#0277BD;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="140" y="340" width="60" height="60" as="geometry" />
+    </mxCell>
+    <!-- Kafka -->
+    <mxCell id="pod_kafka" value="Kafka&#xa;(Bus d&#39;événements)" style="shape=mxgraph.kubernetes.pod;fillColor=#4FC3F7;strokeColor=#0277BD;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="280" y="340" width="60" height="60" as="geometry" />
+    </mxCell>
+    <!-- ETL Processor -->
+    <mxCell id="pod_etl" value="Processeur&#xa;ETL" style="shape=mxgraph.kubernetes.pod;fillColor=#4FC3F7;strokeColor=#0277BD;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="430" y="340" width="60" height="60" as="geometry" />
+    </mxCell>
+    <!-- ML Model -->
+    <mxCell id="pod_ml" value="Modèle LSTM&#xa;(ml-model)" style="shape=mxgraph.kubernetes.pod;fillColor=#4FC3F7;strokeColor=#0277BD;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="580" y="340" width="60" height="60" as="geometry" />
+    </mxCell>
+    <!-- Monitoring UI -->
+    <mxCell id="pod_ui" value="Interface de&#xa;monitoring" style="shape=mxgraph.kubernetes.pod;fillColor=#4FC3F7;strokeColor=#0277BD;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="730" y="340" width="60" height="60" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- FLECHES ENTRE PODS                                   -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="pod_lg" target="pod_kafka" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="pod_kafka" target="pod_etl" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="pod_etl" target="pod_ml" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="pod_ml" target="pod_ui" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+
+    <!-- ETL → GCS (Parquet) -->
+    <mxCell id="e_etl_gcs" value="Parquet" style="edgeStyle=orthogonalEdgeStyle;dashed=1;strokeColor=#34A853;exitX=0.5;exitY=1;" edge="1" source="pod_etl" target="gcs" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- SUBNET PUBLIC + LOAD BALANCER                        -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="subnet_public" value="Subnet Public" style="rounded=1;whiteSpace=wrap;fillColor=#FFF9C4;strokeColor=#F9A825;fontStyle=1;fontSize=10;verticalAlign=top;dashed=1;" vertex="1" parent="1">
+      <mxGeometry x="980" y="150" width="210" height="490" as="geometry" />
+    </mxCell>
+    <mxCell id="lb" value="Cloud Load&#xa;Balancing" style="shape=mxgraph.gcp2.cloud_load_balancing;fillColor=#EA4335;strokeColor=none;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1045" y="340" width="60" height="60" as="geometry" />
+    </mxCell>
+
+    <!-- UI → LB -->
+    <mxCell id="e_ui_lb" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="pod_ui" target="lb" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- USER (exterieur droite)                              -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="user" value="Utilisateur" style="shape=mxgraph.general.user;fillColor=#BDBDBD;strokeColor=#616161;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="1310" y="350" width="50" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="e_lb_user" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="lb" target="user" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- CLOUD IAM + WORKLOAD IDENTITY (gauche)               -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="iam" value="Cloud IAM&#xa;Workload Identity" style="shape=mxgraph.gcp2.cloud_iam;fillColor=#FBBC04;strokeColor=none;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="20" y="360" width="60" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="e_iam_gke" style="dashed=1;strokeColor=#FBBC04;endArrow=none;" edge="1" source="iam" target="gke_box" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- GCS (bas milieu-gauche)                              -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="gcs" value="Cloud Storage&#xa;(GCS)" style="shape=mxgraph.gcp2.cloud_storage;fillColor=#34A853;strokeColor=none;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="430" y="820" width="60" height="60" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- CLOUD BUILD                                          -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="cb_box" value="Cloud Build" style="rounded=1;whiteSpace=wrap;fillColor=#E8F5E9;strokeColor=#2E7D32;fontStyle=1;fontSize=10;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="230" y="830" width="160" height="120" as="geometry" />
+    </mxCell>
+    <mxCell id="cb_icon" value="Cloud Build" style="shape=mxgraph.gcp2.cloud_build;fillColor=#34A853;strokeColor=none;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="290" y="860" width="50" height="50" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- ARTIFACT REGISTRY                                    -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="ar" value="Artifact Registry" style="shape=mxgraph.gcp2.artifact_registry;fillColor=#4285F4;strokeColor=none;fontColor=#000000;fontSize=10;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="590" y="860" width="60" height="60" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- GIT REPOSITORY                                       -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="git" value="Git Repository" style="shape=mxgraph.vcs.git;fillColor=#F06292;strokeColor=#880E4F;fontColor=#000000;fontSize=11;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="295" y="1010" width="50" height="50" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- DEVELOPER                                            -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="dev" value="Développeur" style="shape=mxgraph.general.user;fillColor=#BDBDBD;strokeColor=#616161;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="295" y="1110" width="50" height="60" as="geometry" />
+    </mxCell>
+
+    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- FLECHES CI/CD                                        -->
+    <!-- ═══════════════════════════════════════════════════ -->
+    <mxCell id="e_dev_git" value="Git Push" style="dashed=1;strokeColor=#880E4F;" edge="1" source="dev" target="git" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e_git_cb" value="Trigger" style="dashed=1;strokeColor=#2E7D32;" edge="1" source="git" target="cb_box" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e_cb_ar" value="Push image" style="dashed=1;strokeColor=#4285F4;" edge="1" source="cb_box" target="ar" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e_ar_gke" value="Pull image" style="dashed=1;strokeColor=#4285F4;" edge="1" source="ar" target="gke_box" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e_cb_gke" value="kubectl set image" style="dashed=1;strokeColor=#2E7D32;" edge="1" source="cb_box" target="gke_box" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="e_cb_gcs" value="Store artifacts" style="dashed=1;strokeColor=#34A853;" edge="1" source="cb_box" target="gcs" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+
+    <!-- Observabilité → GKE -->
+    <mxCell id="e_obs_gke" style="dashed=1;strokeColor=#C62828;endArrow=none;" edge="1" source="obs_box" target="gke_box" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+
+  </root>
+</mxGraphModel>

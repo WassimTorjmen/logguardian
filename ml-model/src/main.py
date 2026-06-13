@@ -7,20 +7,19 @@ Boucle :
 import logging
 
 from config import (
-    AWS_REGION,
     DEVICE,
+    GCS_MODELS_BUCKET,
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_GROUP_ID,
     KAFKA_INPUT_TOPIC,
     KAFKA_OUTPUT_TOPIC,
     LOCAL_MODEL_MODE,
     MODEL_DIR,
-    S3_MODELS_BUCKET,
     SEQUENCE_LENGTH,
 )
 from consumer import make_consumer
 from inference.buffer import SlidingBuffer
-from inference.detector import AnomalyDetector, download_models_from_s3
+from inference.detector import AnomalyDetector, download_models_from_gcs
 from producer import make_producer, publish_anomaly
 
 logging.basicConfig(
@@ -38,7 +37,7 @@ def main():
 
     # Téléchargement des artefacts depuis S3 si nécessaire
     if not LOCAL_MODEL_MODE:
-        download_models_from_s3(S3_MODELS_BUCKET, MODEL_DIR, AWS_REGION)
+        download_models_from_gcs(GCS_MODELS_BUCKET, MODEL_DIR)
 
     detector = AnomalyDetector(model_dir=MODEL_DIR, device=DEVICE)
     buffer   = SlidingBuffer(seq_len=SEQUENCE_LENGTH)

@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etl-processor
+  namespace: logguardian
+  annotations:
+    iam.gke.io/gcp-service-account: terraform-sa@logguardian-497218.iam.gserviceaccount.com
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etl-processor-config
+  namespace: logguardian
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka.logguardian.svc.cluster.local:29092
+  KAFKA_INPUT_TOPIC: logs-raw
+  KAFKA_OUTPUT_TOPIC: logs-processed
+  KAFKA_ANOMALY_TOPIC: logs-anomalies
+  KAFKA_GROUP_ID: etl-processor
+  BATCH_SIZE: "500"
+  BATCH_TIMEOUT_SEC: "30"
+  LOCAL_MODE: "false"
+  GCS_BUCKET: logguardian-datalake-logguardian-497218
+  GCS_PREFIX: logs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etl-processor
+  namespace: logguardian
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: etl-processor
+  template:
+    metadata:
+      labels:
+        app: etl-processor
+    spec:
+      serviceAccountName: etl-processor
+      containers:
+        - name: etl-processor
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/etl-processor:aef6afe
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: etl-processor-config
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
