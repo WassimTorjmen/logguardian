@@ -17,6 +17,7 @@ def make_producer(bootstrap_servers: str) -> KafkaProducer:
                 value_serializer=lambda v: v.encode("utf-8"),
                 acks="all",
                 retries=3,
+                api_version=(2, 6, 0),
             )
         except NoBrokersAvailable:
             log.warning("Kafka non disponible pour le producer, retry %d/10...", attempt + 1)
