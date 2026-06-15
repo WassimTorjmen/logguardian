@@ -125,6 +125,9 @@ services:
       REFRESH_INTERVAL_MS: 3000
       ALERT_THRESHOLD: 1.3
       PYTHONUNBUFFERED: "1"
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
+      FEEDBACK_PATH: /app/feedback/rag_feedback.jsonl
     volumes:
       - ./feedback:/app/feedback
     restart: on-failure
