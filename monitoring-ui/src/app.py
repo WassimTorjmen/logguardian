@@ -11,7 +11,16 @@ from collections import Counter, deque
 from datetime import datetime
 
 import dash
-from dash import dash_table, dcc, html, callback_context
+from dash import (
+    dash_table,
+    dcc,
+    html,
+    callback_context,
+    no_update,
+)
+
+from groq import Groq
+#from dash import dash_table, dcc, html, callback_context
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
@@ -34,6 +43,16 @@ SMTP_USER            = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD        = os.getenv("SMTP_PASSWORD", "")
 MAIL_TO              = os.getenv("MAIL_TO", "")
 EMAIL_ALERTS_ENABLED = os.getenv("EMAIL_ALERTS_ENABLED", "false").lower() == "true"
+
+GROQ_API_KEY = os.getenv(
+    "GROQ_API_KEY",
+    "",
+).strip()
+
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b",
+).strip()
 
 _buffer: deque = deque(maxlen=MAX_ROWS)
 _seen: set = set()
@@ -988,6 +1007,108 @@ def _rag_for(row):
     return {"desc":row.get("Message","—"),"score":str(score),"ratio":str(ratio),
             "status":status,"analysis":analysis,"action":action}
 
+def _generate_alternative_rag(
+    row,
+    rejected_analysis,
+    rejected_action,
+):
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "GROQ_API_KEY n'est pas configurée."
+        )
+
+    client = Groq(api_key=GROQ_API_KEY)
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        temperature=0.2,
+        max_completion_tokens=1200,
+        reasoning_effort="low",
+        include_reasoning=False,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Tu es un analyste AIOps spécialisé dans "
+                    "l'analyse de logs. Tu dois proposer une "
+                    "explication claire, prudente et différente "
+                    "de la réponse rejetée. N'invente jamais "
+                    "d'attaque ou de vulnérabilité absente du log."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""
+Un utilisateur a jugé la réponse précédente inutile.
+
+LOG
+Message : {row.get("Message", "inconnu")}
+Source : {row.get("Source", "inconnue")}
+Host : {row.get("Host", "inconnu")}
+Score IA : {row.get("Score IA", "inconnu")}
+Ratio : {row.get("Ratio", "inconnu")}
+Statut : {row.get("Statut", "inconnu")}
+Seuil : {ALERT_THRESHOLD}
+
+RÉPONSE REJETÉE
+Analyse :
+{rejected_analysis}
+
+Recommandation :
+{rejected_action}
+
+Produis une nouvelle analyse réellement différente.
+
+Contraintes :
+- répondre en français ;
+- expliquer le log sans inventer d'informations ;
+- tenir compte du score, du ratio et du seuil ;
+- proposer une action concrète et proportionnée ;
+- ne pas recommander systématiquement un redémarrage ;
+- analyse de 4 phrases maximum ;
+- recommandation de 3 phrases maximum.
+""",
+            },
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "alternative_rag",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "analysis": {
+                            "type": "string",
+                        },
+                        "action": {
+                            "type": "string",
+                        },
+                    },
+                    "required": [
+                        "analysis",
+                        "action",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    )
+
+    content = response.choices[0].message.content
+
+    if not content:
+        raise RuntimeError(
+            "Groq a retourné une réponse vide."
+        )
+
+    result = json.loads(content)
+
+    return {
+        "analysis": result["analysis"].strip(),
+        "action": result["action"].strip(),
+    }
+
 # ─── CALLBACKS ────────────────────────────────────────────────────────────────
 @app.callback(
     Output("current-page","data"),
@@ -1032,23 +1153,94 @@ def update_dashboard(_):
     return (str(total), str(len(anom)), f"{avg:.2f}", str(sources), f"{risk}%",
             _stream_fig(rows), _risk_fig(rows), _services_fig(rows), _score_fig(rows),
             _ai_briefing(rows))
-
 @app.callback(
-    Output("main-table","data"), Output("source-filter","options"),
-    Output("rows-store","data"), Output("logs-count","children"),
-    Input("interval","n_intervals"), Input("current-page","data"),
-    Input("search-text","value"), Input("source-filter","value"),
-    Input("level-filter","value"), Input("limit-filter","value"),
+    Output("main-table", "data"),
+    Output("source-filter", "options"),
+    Output("rows-store", "data"),
+    Output("logs-count", "children"),
+    Input("interval", "n_intervals"),
+    Input("current-page", "data"),
+    Input("search-text", "value"),
+    Input("source-filter", "value"),
+    Input("level-filter", "value"),
+    Input("limit-filter", "value"),
 )
 def update_logs(_, page, search, source, level, limit):
     rows, _t = _visible_rows()
-    filtered = _filter_rows(rows, search, source, level or "all", limit or 200)
-    opts     = [{"label":s,"value":s} for s in sorted({r.get("Source") for r in rows if r.get("Source")})]
-    table    = [{"id":r.get("id"),"Timestamp":r.get("Timestamp",""),"Source":r.get("Source",""),
-                  "Host":r.get("Host",""),"Message":r.get("Message",""),
-                  "Score IA":r.get("Score IA",""),"Ratio":r.get("Ratio",""),"Statut":r.get("Statut","")}
-                 for r in filtered]
-    return table, opts, table, f"{len(filtered)} / {len(rows)} logs"
+
+    filtered = _filter_rows(
+        rows,
+        search,
+        source,
+        level or "all",
+        limit or 200,
+    )
+
+    opts = [
+        {
+            "label": s,
+            "value": s,
+        }
+        for s in sorted({
+            r.get("Source")
+            for r in rows
+            if r.get("Source")
+        })
+    ]
+
+    table = [
+        {
+            "id": r.get("id"),
+            "Timestamp": r.get("Timestamp", ""),
+            "Source": r.get("Source", ""),
+            "Host": r.get("Host", ""),
+            "Message": r.get("Message", ""),
+            "Score IA": r.get("Score IA", ""),
+            "Ratio": r.get("Ratio", ""),
+            "Statut": r.get("Statut", ""),
+            "Model": r.get("Model", "unknown"),
+        }
+        for r in filtered
+    ]
+
+    return (
+        table,
+        opts,
+        table,
+        f"{len(filtered)} / {len(rows)} logs",
+    )
+
+# @app.callback(
+#     Output("main-table","data"), Output("source-filter","options"),
+#     Output("rows-store","data"), Output("logs-count","children"),
+#     Input("interval","n_intervals"), Input("current-page","data"),
+#     Input("search-text","value"), Input("source-filter","value"),
+#     Input("level-filter","value"), Input("limit-filter","value"),
+# )
+# def update_logs(_, page, search, source, level, limit):
+#     rows, _t = _visible_rows()
+#     filtered = _filter_rows(rows, search, source, level or "all", limit or 200)
+#     opts     = [{"label":s,"value":s} for s in sorted({r.get("Source") for r in rows if r.get("Source")})]
+#     table = [
+#     {
+#         "id": r.get("id"),
+#         "Timestamp": r.get("Timestamp", ""),
+#         "Source": r.get("Source", ""),
+#         "Host": r.get("Host", ""),
+#         "Message": r.get("Message", ""),
+#         "Score IA": r.get("Score IA", ""),
+#         "Ratio": r.get("Ratio", ""),
+#         "Statut": r.get("Statut", ""),
+
+#         # Conservé dans les données sans être affiché
+#         "Model": r.get("Model", "unknown"),
+#     }
+#     for r in filtered]
+#     # table    = [{"id":r.get("id"),"Timestamp":r.get("Timestamp",""),"Source":r.get("Source",""),
+#     #               "Host":r.get("Host",""),"Message":r.get("Message",""),
+#     #               "Score IA":r.get("Score IA",""),"Ratio":r.get("Ratio",""),"Statut":r.get("Statut","")}
+#     #              for r in filtered]
+#     return table, opts, table, f"{len(filtered)} / {len(rows)} logs"
 
 @app.callback(
     Output("selected-log-store","data"),
@@ -1071,35 +1263,87 @@ def render_rag(row):
     return r["desc"],r["score"],r["ratio"],r["status"],r["analysis"],r["action"],"Le feedback sera sauvegardé."
 
 @app.callback(
-    Output("feedback-status","children",allow_duplicate=True),
-    Input("fb-up","n_clicks"), Input("fb-down","n_clicks"),
-    State("selected-log-store","data"), prevent_initial_call=True,
+    Output(
+        "rag-analysis",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "rag-action",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "feedback-status",
+        "children",
+        allow_duplicate=True,
+    ),
+    Input("fb-up", "n_clicks"),
+    Input("fb-down", "n_clicks"),
+    State("selected-log-store", "data"),
+    State("rag-analysis", "children"),
+    State("rag-action", "children"),
+    prevent_initial_call=True,
 )
-def save_feedback(up, down, row):
+def save_feedback(
+    up,
+    down,
+    row,
+    current_analysis,
+    current_action,
+):
     if not row:
-        return "Sélectionne d'abord un log."
+        return (
+            no_update,
+            no_update,
+            "Sélectionne d'abord un log.",
+        )
 
     ctx = callback_context
 
     if not ctx.triggered:
         raise PreventUpdate
 
-    trigger = ctx.triggered[0]["prop_id"].split(".")[0]
+    trigger = (
+        ctx.triggered[0]["prop_id"]
+        .split(".")[0]
+    )
 
+    # Pouce positif :
+    # on garde la réponse actuellement affichée.
+    # Aucun appel Groq et aucun enregistrement JSON.
     if trigger == "fb-up":
-        feedback = "positive"
-    elif trigger == "fb-down":
-        feedback = "negative"
-    else:
+        return (
+            no_update,
+            no_update,
+            "✅ Explication validée.",
+        )
+
+    if trigger != "fb-down":
         raise PreventUpdate
 
-    # Recrée exactement l'analyse et la recommandation affichées
-    rag_result = _rag_for(row)
+    initial_rag = _rag_for(row)
+
+    # La réponse actuellement affichée devient la réponse rejetée.
+    # Au premier clic, c'est la réponse initiale.
+    # Aux clics suivants, c'est la dernière réponse Groq.
+    rejected_analysis = (
+        str(current_analysis).strip()
+        if current_analysis
+        else initial_rag["analysis"]
+    )
+
+    rejected_action = (
+        str(current_action).strip()
+        if current_action
+        else initial_rag["action"]
+    )
 
     record = {
-        # Informations sur le feedback
-        "feedback_timestamp": datetime.now().isoformat(timespec="seconds"),
-        "feedback": feedback,
+        "feedback_timestamp": datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        "feedback": "negative",
 
         # Informations du log
         "log_id": row.get("id"),
@@ -1109,34 +1353,461 @@ def save_feedback(up, down, row):
         "score_ia": row.get("Score IA"),
         "ratio": row.get("Ratio"),
         "statut": row.get("Statut"),
+        "model_version": row.get(
+            "Model",
+            "unknown",
+        ),
 
-        # Réponse RAG réellement évaluée
-        "rag_analysis": rag_result.get("analysis"),
-        "rag_recommendation": rag_result.get("action"),
+        # Réponse que l'utilisateur vient de rejeter
+        "rag_analysis": rejected_analysis,
+        "rag_recommendation": rejected_action,
 
-        # Versions utiles pour le suivi
+        # Versions
         "rag_version": "rag_v1",
         "prompt_version": "prompt_v1",
-        #"detection_model_version": row.get("Model", "unknown"),
+        "regeneration_prompt_version": "groq_regeneration_v1",
         "alert_threshold": ALERT_THRESHOLD,
     }
 
+    alternative = None
+
+    # Appel Groq uniquement après un pouce négatif
     try:
-        feedback_directory = os.path.dirname(FEEDBACK_PATH)
+        alternative = _generate_alternative_rag(
+            row=row,
+            rejected_analysis=rejected_analysis,
+            rejected_action=rejected_action,
+        )
 
-        if feedback_directory:
-            os.makedirs(feedback_directory, exist_ok=True)
-
-        with open(FEEDBACK_PATH, "a", encoding="utf-8") as file:
-            file.write(
-                json.dumps(record, ensure_ascii=False) + "\n"
-            )
-
-        return "✅ Feedback et réponse RAG enregistrés."
+        record["replacement_rag_analysis"] = (
+            alternative["analysis"]
+        )
+        record["replacement_rag_recommendation"] = (
+            alternative["action"]
+        )
+        record["replacement_generator"] = GROQ_MODEL
+        record["groq_success"] = True
+        record["groq_error"] = None
 
     except Exception as error:
-        log.exception("Erreur pendant l'enregistrement du feedback")
-        return f"⚠️ Feedback non sauvegardé : {error}"
+        log.exception(
+            "Erreur pendant la génération Groq"
+        )
+
+        record["replacement_rag_analysis"] = None
+        record["replacement_rag_recommendation"] = None
+        record["replacement_generator"] = GROQ_MODEL
+        record["groq_success"] = False
+        record["groq_error"] = str(error)
+
+    # Un seul enregistrement JSON par clic négatif
+    try:
+        feedback_directory = os.path.dirname(
+            FEEDBACK_PATH
+        )
+
+        if feedback_directory:
+            os.makedirs(
+                feedback_directory,
+                exist_ok=True,
+            )
+
+        with open(
+            FEEDBACK_PATH,
+            "a",
+            encoding="utf-8",
+        ) as file:
+            file.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    except Exception as error:
+        log.exception(
+            "Erreur pendant l'enregistrement "
+            "du feedback négatif"
+        )
+
+        return (
+            no_update,
+            no_update,
+            f"⚠️ Feedback non sauvegardé : {error}",
+        )
+
+    # L'appel Groq a échoué, mais le feedback est conservé.
+    if alternative is None:
+        return (
+            no_update,
+            no_update,
+            (
+                "👎 Feedback enregistré, mais la nouvelle "
+                "analyse n'a pas pu être générée : "
+                f"{record['groq_error']}"
+            ),
+        )
+
+    # Remplacement de l'analyse et de la recommandation
+    return (
+        alternative["analysis"],
+        alternative["action"],
+        (
+            "🔄 Nouvelle réponse générée avec "
+            f"{GROQ_MODEL}. Tu peux encore donner "
+            "un pouce négatif pour obtenir une autre réponse."
+        ),
+    )
+
+
+
+# @app.callback(
+#     Output(
+#         "rag-analysis",
+#         "children",
+#         allow_duplicate=True,
+#     ),
+#     Output(
+#         "rag-action",
+#         "children",
+#         allow_duplicate=True,
+#     ),
+#     Output(
+#         "feedback-status",
+#         "children",
+#         allow_duplicate=True,
+#     ),
+#     Input("fb-up", "n_clicks"),
+#     Input("fb-down", "n_clicks"),
+#     State("selected-log-store", "data"),
+#     State("rag-analysis", "children"),
+#     State("rag-action", "children"),
+#     prevent_initial_call=True,
+# )
+# def save_feedback(
+#     up,
+#     down,
+#     row,
+#     current_analysis,
+#     current_action,
+# ):
+#     if not row:
+#         return (
+#             no_update,
+#             no_update,
+#             "Sélectionne d'abord un log.",
+#         )
+
+#     ctx = callback_context
+
+#     if not ctx.triggered:
+#         raise PreventUpdate
+
+#     trigger = (
+#         ctx.triggered[0]["prop_id"]
+#         .split(".")[0]
+#     )
+
+#     # Pouce positif :
+#     # rien n'est enregistré et Groq n'est pas appelé.
+#     if trigger == "fb-up":
+#         return (
+#             no_update,
+#             no_update,
+#             "✅ Explication validée.",
+#         )
+
+#     if trigger != "fb-down":
+#         raise PreventUpdate
+
+#     initial_rag = _rag_for(row)
+
+#     rejected_analysis = (
+#         str(current_analysis).strip()
+#         if current_analysis
+#         else initial_rag["analysis"]
+#     )
+
+#     rejected_action = (
+#         str(current_action).strip()
+#         if current_action
+#         else initial_rag["action"]
+#     )
+
+#     # 1. Enregistrement du feedback négatif
+#     record = {
+#     "feedback_timestamp": datetime.now().isoformat(
+#         timespec="seconds"
+#     ),
+#     "feedback": "negative",
+
+#     "log_id": row.get("id"),
+#     "source": row.get("Source"),
+#     "host": row.get("Host"),
+#     "message": row.get("Message"),
+#     "score_ia": row.get("Score IA"),
+#     "ratio": row.get("Ratio"),
+#     "statut": row.get("Statut"),
+
+#     "model_version": row.get(
+#         "Model",
+#         "unknown",
+#     ),
+
+#     "rag_analysis": rejected_analysis,
+#     "rag_recommendation": rejected_action,
+
+#     "rag_version": "rag_v1",
+#     "prompt_version": "prompt_v1",
+#     "regeneration_prompt_version": "groq_regeneration_v1",
+#     "alert_threshold": ALERT_THRESHOLD,
+# }
+#     # record = {
+#     #     "feedback_timestamp": datetime.now().isoformat(
+#     #         timespec="seconds"
+#     #     ),
+#     #     "feedback": "negative",
+
+#     #     "log_id": row.get("id"),
+#     #     "source": row.get("Source"),
+#     #     "host": row.get("Host"),
+#     #     "message": row.get("Message"),
+#     #     "score_ia": row.get("Score IA"),
+#     #     "ratio": row.get("Ratio"),
+#     #     "statut": row.get("Statut"),
+
+#     #     "model_version": row.get(
+#     #         "Model",
+#     #         "unknown",
+#     #     ),
+
+#     #     # Réponse que l'utilisateur vient de rejeter
+#     #     "rag_analysis": rejected_analysis,
+#     #     "rag_recommendation": rejected_action,
+
+#     #     "rag_version": "rag_v1",
+#     #     "prompt_version": "groq_regeneration_v1",
+#     #     "alert_threshold": ALERT_THRESHOLD,
+#     # }
+
+#     try:
+#         feedback_directory = os.path.dirname(
+#             FEEDBACK_PATH
+#         )
+
+#         if feedback_directory:
+#             os.makedirs(
+#                 feedback_directory,
+#                 exist_ok=True,
+#             )
+
+#         with open(
+#             FEEDBACK_PATH,
+#             "a",
+#             encoding="utf-8",
+#         ) as file:
+#             file.write(
+#                 json.dumps(
+#                     record,
+#                     ensure_ascii=False,
+#                 )
+#                 + "\n"
+#             )
+
+#     except Exception as error:
+#         log.exception(
+#             "Erreur pendant l'enregistrement "
+#             "du feedback négatif"
+#         )
+
+#         return (
+#             no_update,
+#             no_update,
+#             f"⚠️ Feedback non sauvegardé : {error}",
+#         )
+    
+#     try:
+#     # Appel Groq uniquement après un pouce négatif
+#     alternative = _generate_alternative_rag(
+#         row=row,
+#         rejected_analysis=rejected_analysis,
+#         rejected_action=rejected_action,
+#     )
+
+#     # On ajoute la nouvelle réponse au même enregistrement
+#     record["replacement_rag_analysis"] = alternative["analysis"]
+#     record["replacement_rag_recommendation"] = alternative["action"]
+#     record["replacement_generator"] = GROQ_MODEL
+#     record["groq_success"] = True
+#     record["groq_error"] = None
+
+# except Exception as error:
+#     log.exception("Erreur pendant l'appel à Groq")
+
+#     alternative = None
+
+#     record["replacement_rag_analysis"] = None
+#     record["replacement_rag_recommendation"] = None
+#     record["replacement_generator"] = GROQ_MODEL
+#     record["groq_success"] = False
+#     record["groq_error"] = str(error)
+
+
+#     try:
+#         feedback_directory = os.path.dirname(FEEDBACK_PATH)
+
+#         if feedback_directory:
+#             os.makedirs(
+#                 feedback_directory,
+#                 exist_ok=True,
+#             )
+
+#         with open(
+#             FEEDBACK_PATH,
+#             "a",
+#             encoding="utf-8",
+#         ) as file:
+#             file.write(
+#                 json.dumps(
+#                     record,
+#                     ensure_ascii=False,
+#                 )
+#                 + "\n"
+#             )
+
+#     except Exception as error:
+#         log.exception(
+#             "Erreur pendant l'enregistrement du feedback négatif"
+#         )
+
+#         return (
+#             no_update,
+#             no_update,
+#             f"⚠️ Feedback non sauvegardé : {error}",
+#         )
+
+
+#     if alternative is None:
+#         return (
+#             no_update,
+#             no_update,
+#             (
+#                 "👎 Feedback enregistré, mais la nouvelle "
+#                 f"analyse n'a pas pu être générée : "
+#                 f"{record['groq_error']}"
+#             ),
+#         )
+
+
+#     return (
+#         alternative["analysis"],
+#         alternative["action"],
+#         (
+#             "🔄 Une nouvelle analyse a été générée "
+#             f"avec {GROQ_MODEL}."
+#         ),
+#     )
+#     # # 2. Appel Groq uniquement après le pouce négatif
+#     # try:
+#     #     alternative = _generate_alternative_rag(
+#     #         row=row,
+#     #         rejected_analysis=rejected_analysis,
+#     #         rejected_action=rejected_action,
+#     #     )
+
+#     #     return (
+#     #         alternative["analysis"],
+#     #         alternative["action"],
+#     #         (
+#     #             "🔄 Une nouvelle analyse a été générée "
+#     #             f"avec {GROQ_MODEL}."
+#     #         ),
+#     #     )
+
+#     # except Exception as error:
+#     #     log.exception(
+#     #         "Erreur pendant l'appel à Groq"
+#     #     )
+
+#     #     # Le feedback reste enregistré même si Groq échoue.
+#     #     return (
+#     #         no_update,
+#     #         no_update,
+#     #         (
+#     #             "👎 Feedback enregistré, mais la nouvelle "
+#     #             f"analyse n'a pas pu être générée : {error}"
+#     #         ),
+#     #     )
+
+
+# @app.callback(
+#     Output("feedback-status","children",allow_duplicate=True),
+#     Input("fb-up","n_clicks"), Input("fb-down","n_clicks"),
+#     State("selected-log-store","data"), prevent_initial_call=True,
+# )
+# def save_feedback(up, down, row):
+#     if not row:
+#         return "Sélectionne d'abord un log."
+
+#     ctx = callback_context
+
+#     if not ctx.triggered:
+#         raise PreventUpdate
+
+#     trigger = ctx.triggered[0]["prop_id"].split(".")[0]
+
+#     if trigger == "fb-up":
+#         feedback = "positive"
+#     elif trigger == "fb-down":
+#         feedback = "negative"
+#     else:
+#         raise PreventUpdate
+
+#     # Recrée exactement l'analyse et la recommandation affichées
+#     rag_result = _rag_for(row)
+
+#     record = {
+#         # Informations sur le feedback
+#         "feedback_timestamp": datetime.now().isoformat(timespec="seconds"),
+#         "feedback": feedback,
+
+#         # Informations du log
+#         "log_id": row.get("id"),
+#         "source": row.get("Source"),
+#         "host": row.get("Host"),
+#         "message": row.get("Message"),
+#         "score_ia": row.get("Score IA"),
+#         "ratio": row.get("Ratio"),
+#         "statut": row.get("Statut"),
+
+#         # Réponse RAG réellement évaluée
+#         "rag_analysis": rag_result.get("analysis"),
+#         "rag_recommendation": rag_result.get("action"),
+
+#         # Versions utiles pour le suivi
+#         "rag_version": "rag_v1",
+#         "prompt_version": "prompt_v1",
+#         #"detection_model_version": row.get("Model", "unknown"),
+#         "alert_threshold": ALERT_THRESHOLD,
+#     }
+
+#     try:
+#         feedback_directory = os.path.dirname(FEEDBACK_PATH)
+
+#         if feedback_directory:
+#             os.makedirs(feedback_directory, exist_ok=True)
+
+#         with open(FEEDBACK_PATH, "a", encoding="utf-8") as file:
+#             file.write(
+#                 json.dumps(record, ensure_ascii=False) + "\n"
+#             )
+
+#         return "✅ Feedback et réponse RAG enregistrés."
+
+#     except Exception as error:
+#         log.exception("Erreur pendant l'enregistrement du feedback")
+#         return f"⚠️ Feedback non sauvegardé : {error}"
 # def save_feedback(up, down, row):
 #     if not row: return "Sélectionne d'abord un log."
 #     ctx = callback_context
