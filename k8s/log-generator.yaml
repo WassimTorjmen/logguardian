@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: log-data-pvc
+  namespace: logguardian
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard-rwo   # GKE default (SSD)
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: log-generator
+  namespace: logguardian
+  # Workload Identity GCP : lie ce ServiceAccount au GSA terraform-sa
+  annotations:
+    iam.gke.io/gcp-service-account: terraform-sa@logguardian-497218.iam.gserviceaccount.com
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-generator-config
+  namespace: logguardian
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka.logguardian.svc.cluster.local:29092
+  KAFKA_TOPIC: logs-raw
+  REPLAY_SPEED: "50"
+  DATA_DIR: /data
+  LOG_SOURCES: linux,ssh,hadoop,supercomputer,android,spark
+  DATA_S3_URI: gs://logguardian-datalake-logguardian-497218/raw-logs/
+  S3_BUCKET: logguardian-datalake-logguardian-497218
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-generator
+  namespace: logguardian
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: log-generator
+  template:
+    metadata:
+      labels:
+        app: log-generator
+    spec:
+      serviceAccountName: log-generator
+      initContainers:
+        - name: sync-log-data
+          image: google/cloud-sdk:slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              # Si les données sont déjà présentes, skip le téléchargement
+              if [ -f /data/.sync-done ]; then
+                echo "Data already present, skipping sync."
+                exit 0
+              fi
+              echo "First sync from $DATA_S3_URI ..."
+              gsutil -m rsync -r "$DATA_S3_URI" /data/ &&
+              touch /data/.sync-done &&
+              echo "Sync complete." &&
+              ls /data/
+          env:
+            - name: DATA_S3_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: log-generator-config
+                  key: DATA_S3_URI
+          volumeMounts:
+            - name: log-data
+              mountPath: /data
+      containers:
+        - name: log-generator
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/log-generator:aef6afe
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: log-generator-config
+          volumeMounts:
+            - name: log-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: log-data
+          persistentVolumeClaim:
+            claimName: log-data-pvc

@@ -1,4 +1,4 @@
-# LogGuardian — ML Model
+﻿# LogGuardian — ML Model
 
 Détection d'anomalies dans les logs par LSTM Autoencoder.
 

@@ -1,3 +1,11 @@
+# Modèles ML (fichiers lourds → stockés sur GCS)
+*.pt
+*.pkl
+*.npy
+
+# Fichiers système Mac
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -26,13 +34,17 @@ share/python-wheels/
 *.egg
 MANIFEST
 data/
+logs/
 .claude/
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
-
+# Terraform local state and providers
+**/.terraform/
+*.tfstate
+*.tfstate.*
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

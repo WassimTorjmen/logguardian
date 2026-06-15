@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ml-model
+  namespace: logguardian
+  annotations:
+    iam.gke.io/gcp-service-account: terraform-sa@logguardian-497218.iam.gserviceaccount.com
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-model-config
+  namespace: logguardian
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka.logguardian.svc.cluster.local:29092
+  KAFKA_INPUT_TOPIC: logs-processed
+  KAFKA_OUTPUT_TOPIC: logs-anomalies-ml
+  KAFKA_GROUP_ID: ml-model
+  GCS_MODELS_BUCKET: logguardian-models-logguardian-497218
+  LOCAL_MODEL_MODE: "false"
+  MODEL_DIR: /app/models
+  SEQUENCE_LENGTH: "10"
+  DEVICE: cpu
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-model
+  namespace: logguardian
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ml-model
+  template:
+    metadata:
+      labels:
+        app: ml-model
+    spec:
+      serviceAccountName: ml-model
+      enableServiceLinks: false
+      containers:
+        - name: ml-model
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/ml-model:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: ml-model-config
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

@@ -1,8 +1,9 @@
-torch
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
 numpy
 pandas
 pyarrow
 scikit-learn
 kafka-python==2.0.2
-boto3
+google-cloud-storage==2.16.0
 python-dotenv

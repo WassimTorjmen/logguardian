@@ -97,7 +97,7 @@ services:
       kafka:
         condition: service_healthy
     volumes:
-      - ./ml-model/models:/app/models:ro
+      - ./ml-model/models:/app/models
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_INPUT_TOPIC: logs-processed

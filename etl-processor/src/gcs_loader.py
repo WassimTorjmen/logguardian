@@ -3,10 +3,10 @@ import logging
 import os
 from datetime import datetime, timezone
 
-import boto3
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from google.cloud import storage
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ PARQUET_SCHEMA = pa.schema([
 ])
 
 
-def _build_s3_key(source: str, year: int, month: int, day: int, prefix: str) -> str:
+def _build_gcs_key(source: str, year: int, month: int, day: int, prefix: str) -> str:
     batch_id = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     return (
         f"{prefix}/"
@@ -45,27 +45,29 @@ def _df_to_parquet_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-def load_to_s3(
+def load_to_gcs(
     df: pd.DataFrame,
     bucket: str,
     prefix: str,
-    region: str,
 ) -> int:
     """
-    Write one Parquet file per (source, year, month, day) partition to S3.
+    Write one Parquet file per (source, year, month, day) partition to GCS.
+    Auth via Workload Identity (pas besoin de clé explicite sur GKE).
     Returns the number of files written.
     """
     if df.empty:
         return 0
 
-    s3 = boto3.client("s3", region_name=region)
+    gcs_client = storage.Client()
+    gcs_bucket = gcs_client.bucket(bucket)
     files_written = 0
 
     for (source, year, month, day), group in df.groupby(["source", "year", "month", "day"]):
-        key = _build_s3_key(source, year, month, day, prefix)
+        key = _build_gcs_key(source, year, month, day, prefix)
         data = _df_to_parquet_bytes(group.reset_index(drop=True))
-        s3.put_object(Bucket=bucket, Key=key, Body=data)
-        log.info("S3 upload: s3://%s/%s (%d rows)", bucket, key, len(group))
+        blob = gcs_bucket.blob(key)
+        blob.upload_from_string(data, content_type="application/octet-stream")
+        log.info("GCS upload: gs://%s/%s (%d rows)", bucket, key, len(group))
         files_written += 1
 
     return files_written
@@ -77,7 +79,7 @@ def load_to_local(
 ) -> int:
     """
     Write Parquet files locally (LOCAL_MODE=true).
-    Same partitioning as S3 for easy migration.
+    Same partitioning as GCS for easy migration.
     Returns the number of files written.
     """
     if df.empty:
