@@ -1313,11 +1313,76 @@ def save_feedback(
     # on garde la réponse actuellement affichée.
     # Aucun appel Groq et aucun enregistrement JSON.
     if trigger == "fb-up":
-        return (
-            no_update,
-            no_update,
-            "✅ Explication validée.",
-        )
+        positive_record = {
+            "feedback_timestamp": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+            "feedback": "positive",
+            "accepted": True,
+            "log_id": row.get("id"),
+            "model_version": row.get(
+                "Model",
+                "unknown",
+            ),
+            "accepted_rag_analysis": (
+                str(current_analysis).strip()
+                if current_analysis
+                else None
+            ),
+            "accepted_rag_recommendation": (
+                str(current_action).strip()
+                if current_action
+                else None
+            ),
+        }
+
+        try:
+            feedback_directory = os.path.dirname(
+                FEEDBACK_PATH
+            )
+
+            if feedback_directory:
+                os.makedirs(
+                    feedback_directory,
+                    exist_ok=True,
+                )
+
+            with open(
+                FEEDBACK_PATH,
+                "a",
+                encoding="utf-8",
+            ) as file:
+                file.write(
+                    json.dumps(
+                        positive_record,
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            return (
+                no_update,
+                no_update,
+                "✅ Explication validée et acceptation enregistrée.",
+            )
+
+        except Exception as error:
+            log.exception(
+                "Erreur pendant l'enregistrement "
+                "du feedback positif"
+            )
+
+            return (
+                no_update,
+                no_update,
+                f"⚠️ Validation non sauvegardée : {error}",
+            )
+    # if trigger == "fb-up":
+    #     return (
+    #         no_update,
+    #         no_update,
+    #         "✅ Explication validée.",
+    #     )
 
     if trigger != "fb-down":
         raise PreventUpdate
