@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -8,6 +6,9 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -37,6 +38,8 @@ services:
       timeout: 10s
       retries: 15
       start_period: 30s
+    volumes:
+      - kafka-data:/var/lib/kafka/data
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -63,6 +66,7 @@ services:
       REPLAY_SPEED: "100"
       DATA_DIR: /data
       LOG_SOURCES: linux,ssh,hadoop,spark,supercomputer,hdfs
+      PYTHONUNBUFFERED: "1"
     restart: on-failure
 
   etl-processor:
@@ -83,6 +87,7 @@ services:
       BATCH_TIMEOUT_SEC: "30"
       LOCAL_MODE: "true"
       LOCAL_OUTPUT_DIR: /tmp/etl-output
+      PYTHONUNBUFFERED: "1"
     restart: on-failure
 
   ml-model:
@@ -102,6 +107,7 @@ services:
       LOCAL_MODEL_MODE: "true"
       SEQUENCE_LENGTH: "10"
       DEVICE: cpu
+      PYTHONUNBUFFERED: "1"
     restart: on-failure
 
   monitoring-ui:
@@ -118,29 +124,38 @@ services:
       MAX_ROWS: 2000
       REFRESH_INTERVAL_MS: 3000
       ALERT_THRESHOLD: 1.3
-      EMAIL_ALERTS_ENABLED: "false" #Set to "true" to enable email alerts
-      SMTP_HOST: smtp.gmail.com
-      SMTP_PORT: 587
-      SMTP_USER: eya796067@gmail.com
-      SMTP_PASSWORD: "ksjl uvxs jxuw rinb"
-      MAIL_TO: eya796067@gmail.com
+      PYTHONUNBUFFERED: "1"
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
+      FEEDBACK_PATH: /app/feedback/rag_feedback.jsonl
     volumes:
       - ./feedback:/app/feedback
     restart: on-failure
   
-  monitoring-ui-streamlit:
-    build: ./monitoring-ui-streamlit
-    ports:
-      - "8501:8501"
+  email-sender:
+    build:
+      context: ./email-sender
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: logs-anomalies-ml
-      MAX_ROWS: 2000
-      ALERT_THRESHOLD: 2.0
-      REFRESH_SECONDS: 3
+      ALERT_THRESHOLD: 1.3
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: 587
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      MAIL_TO: ${MAIL_TO}
+      EMAIL_COOLDOWN_SECONDS: 60
+      PYTHONUNBUFFERED: "1"
     depends_on:
       kafka:
         condition: service_healthy
+      ml-model:
+        condition: service_started
+    restart: unless-stopped
+
 
 volumes:
   etl-output:
+  kafka-data:
+  zookeeper-data:
+  zookeeper-log:

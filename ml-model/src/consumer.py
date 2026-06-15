@@ -15,10 +15,11 @@ def make_consumer(bootstrap_servers: str, topic: str, group_id: str) -> KafkaCon
                 topic,
                 bootstrap_servers=bootstrap_servers,
                 group_id=group_id,
-                auto_offset_reset="latest",
+                auto_offset_reset="earliest",
                 enable_auto_commit=True,
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 consumer_timeout_ms=1000,
+                api_version=(2, 6, 0),
             )
             log.info("Connecté à Kafka %s → topic %s", bootstrap_servers, topic)
             return consumer
