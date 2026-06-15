@@ -1,14 +1,17 @@
 {
-  "threshold": 0.5733379125595093,
+  "threshold": 0.7634741067886353,
   "percentile": 95,
-  "computed_at": "2026-05-25T18:40:36.349931+00:00",
-  "n_samples": 166411,
+  "computed_at": "2026-06-14T13:04:18.143540+00:00",
+  "n_samples": 36366,
   "n_features": 77,
   "seq_len": 10,
   "hidden_size": 64,
   "latent_size": 32,
+  "num_layers": 2,
+  "dropout": 0.2,
   "vocab_size": 5000,
   "embed_dim": 64,
-  "train_loss": 0.14034617794273782,
-  "val_loss": 0.14794020596512095
+  "train_loss": 0.2987838056031901,
+  "val_loss": 0.22485754441188383,
+  "best_val_loss": 0.22485754441188383
 }
