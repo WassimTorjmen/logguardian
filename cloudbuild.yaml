@@ -7,7 +7,7 @@ steps:
       - '-c'
       - |
         registry=europe-west1-docker.pkg.dev/$PROJECT_ID/logguardian
-        for service in log-generator etl-processor ml-model monitoring-ui; do
+        for service in log-generator etl-processor ml-model monitoring-ui email-sender; do
           if [ -f "$service/Dockerfile" ]; then
             echo "Building $service..."
             docker pull $registry/$service:latest || true
@@ -34,7 +34,7 @@ steps:
         gcloud container clusters get-credentials logguardian \
           --zone=europe-west1-b \
           --project=$PROJECT_ID
-        for service in log-generator etl-processor ml-model monitoring-ui; do
+        for service in log-generator etl-processor ml-model monitoring-ui email-sender; do
           if [ -f "$service/Dockerfile" ]; then
             echo "Updating deployment/$service on GKE..."
             kubectl set image deployment/$service \
