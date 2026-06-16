@@ -120,8 +120,7 @@ LogGuardian — AIOps Command Center
     msg["From"] = SMTP_USER
     msg["To"] = MAIL_TO
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.starttls()
+    with smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=20) as server:
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.send_message(msg)
 
