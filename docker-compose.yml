@@ -129,6 +129,9 @@ services:
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
       FEEDBACK_PATH: /app/feedback/rag_feedback.jsonl
       RAG_NEGATIVE_LIMIT: ${RAG_NEGATIVE_LIMIT:-20}
+      LOGIN_USERNAME: ${LOGIN_USERNAME}
+      LOGIN_PASSWORD: ${LOGIN_PASSWORD}
+      DASH_SECRET_KEY: ${DASH_SECRET_KEY}
     volumes:
       - ./feedback:/app/feedback
     restart: on-failure

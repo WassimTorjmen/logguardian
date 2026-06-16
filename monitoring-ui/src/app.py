@@ -41,6 +41,7 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from groq import Groq
 import plotly.graph_objects as go
+from flask import session
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +95,9 @@ GROQ_FALLBACK_MODEL = os.getenv(
     "GROQ_FALLBACK_MODEL",
     "",
 ).strip()
+
+LOGIN_USERNAME = os.getenv("LOGIN_USERNAME", "admin").strip()
+LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "admin").strip()
 
 _buffer: deque[dict[str, Any]] = deque(maxlen=MAX_ROWS)
 _lock = threading.Lock()
@@ -650,11 +654,38 @@ def _sidebar() -> html.Div:
                 },
             ),
             html.Div(
-                style={"padding": "0 12px", "flex": "1"},
+                style={"padding": "0 12px", "flex": "1", "minHeight": "0", "overflowY": "auto"},
                 children=[
                     nav_button("dashboard", "▦", "Vue cockpit", "KPIs · graphes · risque"),
                     nav_button("logs", "≡", "Flux logs", "Recherche · IA · feedback"),
                     nav_button("alerts", "⚠", "Incident board", "Anomalies critiques"),
+                ],
+            ),
+            html.Button(
+                id="logout-button",
+                n_clicks=0,
+                title="Se déconnecter",
+                style={
+                    "width": "calc(100% - 28px)",
+                    "height": "44px",
+                    "margin": "8px 14px 10px",
+                    "padding": "0 13px",
+                    "borderRadius": "13px",
+                    "border": "1px solid rgba(248,113,113,.22)",
+                    "background": "linear-gradient(145deg,rgba(248,113,113,.11),rgba(239,68,68,.055))",
+                    "color": "#fca5a5",
+                    "fontWeight": "800",
+                    "fontSize": "11px",
+                    "cursor": "pointer",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "justifyContent": "center",
+                    "gap": "9px",
+                    "boxShadow": "0 8px 20px rgba(127,29,29,.08)",
+                },
+                children=[
+                    html.Span("⏻", style={"fontSize": "16px", "lineHeight": "1"}),
+                    html.Span("Déconnexion", className="sidebar-text"),
                 ],
             ),
             html.Div(
@@ -1918,49 +1949,184 @@ def _alerts_page() -> html.Div:
 # ─────────────────────────────────────────────────────────────────────────────
 # ROOT LAYOUT
 # ─────────────────────────────────────────────────────────────────────────────
-app.layout = html.Div(
-    style={
-        "height": "100vh",
-        "display": "flex",
-        "background": (
-            "radial-gradient(circle at 15% 10%,rgba(37,99,235,.08),transparent 28%),"
-            "radial-gradient(circle at 88% 8%,rgba(139,92,246,.08),transparent 30%),"
-            f"{BG}"
-        ),
-        "overflow": "hidden",
-    },
-    children=[
-        _sidebar(),
-        html.Div(
-            style={
-                "flex": "1",
-                "minWidth": "0",
-                "height": "100vh",
-                "overflow": "hidden",
-                "display": "flex",
-                "flexDirection": "column",
-            },
-            children=[
-                _dashboard_page(),
-                _logs_page(),
-                _alerts_page(),
-            ],
-        ),
-        dcc.Interval(
-            id="interval",
-            interval=REFRESH_INTERVAL_MS,
-            n_intervals=0,
-        ),
-        dcc.Store(id="current-page", data="logs"),
-        dcc.Store(id="selected-log-store", data=None),
-        dcc.Store(id="rag-open-store", data=False),
-        dcc.Store(id="rag-generated-store", data=False),
+def _login_page() -> html.Div:
+    return html.Div(
+        style={
+            "minHeight": "100vh",
+            "display": "grid",
+            "placeItems": "center",
+            "padding": "24px",
+            "background": (
+                "radial-gradient(circle at 15% 10%,rgba(37,99,235,.24),transparent 30%),"
+                "radial-gradient(circle at 85% 15%,rgba(139,92,246,.22),transparent 32%),"
+                "linear-gradient(145deg,#071225,#0c1b36)"
+            ),
+        },
+        children=[
+            html.Div(
+                style={
+                    "width": "100%",
+                    "maxWidth": "430px",
+                    "padding": "34px",
+                    "borderRadius": "24px",
+                    "background": "rgba(255,255,255,.97)",
+                    "border": "1px solid rgba(255,255,255,.30)",
+                    "boxShadow": "0 28px 80px rgba(0,0,0,.35)",
+                },
+                children=[
+                    html.Div(
+                        "◈",
+                        style={
+                            "width": "58px",
+                            "height": "58px",
+                            "display": "grid",
+                            "placeItems": "center",
+                            "margin": "0 auto 18px",
+                            "borderRadius": "18px",
+                            "fontSize": "28px",
+                            "color": "white",
+                            "background": "linear-gradient(135deg,#60a5fa,#2563eb,#7c3aed)",
+                            "boxShadow": "0 15px 35px rgba(37,99,235,.35)",
+                        },
+                    ),
+                    html.H1(
+                        "LogGuardian",
+                        style={"margin": "0", "textAlign": "center", "fontSize": "28px", "fontWeight": "900", "color": TXT},
+                    ),
+                    html.P(
+                        "Connectez-vous à l'AIOps Command Center",
+                        style={"textAlign": "center", "color": MUT, "fontSize": "13px", "marginBottom": "28px"},
+                    ),
+                    html.Label("Nom d'utilisateur", style={"display": "block", "fontSize": "11px", "fontWeight": "800", "color": MUT, "marginBottom": "7px"}),
+                    dcc.Input(
+                        id="login-username",
+                        type="text",
+                        placeholder="Votre identifiant",
+                        autoComplete="username",
+                        style={"width": "100%", "height": "46px", "padding": "0 14px", "borderRadius": "12px", "border": f"1px solid {BD}", "fontSize": "13px", "outline": "none", "marginBottom": "17px"},
+                    ),
+                    html.Label("Mot de passe", style={"display": "block", "fontSize": "11px", "fontWeight": "800", "color": MUT, "marginBottom": "7px"}),
+                    dcc.Input(
+                        id="login-password",
+                        type="password",
+                        placeholder="Votre mot de passe",
+                        autoComplete="current-password",
+                        style={"width": "100%", "height": "46px", "padding": "0 14px", "borderRadius": "12px", "border": f"1px solid {BD}", "fontSize": "13px", "outline": "none", "marginBottom": "20px"},
+                    ),
+                    html.Button(
+                        "Se connecter",
+                        id="login-button",
+                        n_clicks=0,
+                        style={
+                            "width": "100%",
+                            "height": "48px",
+                            "border": "none",
+                            "borderRadius": "13px",
+                            "cursor": "pointer",
+                            "color": "white",
+                            "fontSize": "13px",
+                            "fontWeight": "900",
+                            "background": "linear-gradient(135deg,#7c3aed,#2563eb)",
+                            "boxShadow": "0 12px 26px rgba(37,99,235,.25)",
+                        },
+                    ),
+                    html.Div(id="login-error", style={"marginTop": "14px", "textAlign": "center", "fontSize": "11px", "fontWeight": "700", "color": RED, "minHeight": "18px"}),
+                ],
+            )
+        ],
+    )
 
-        # Passe à True après un clic sur « Utile ».
-        # Il est réinitialisé dès qu'un autre log est sélectionné.
-        dcc.Store(id="feedback-accepted-store", data=False),
-    ],
+
+def _authenticated_layout() -> html.Div:
+    return html.Div(
+        style={
+            "height": "100vh",
+            "display": "flex",
+            "background": (
+                "radial-gradient(circle at 15% 10%,rgba(37,99,235,.08),transparent 28%),"
+                "radial-gradient(circle at 88% 8%,rgba(139,92,246,.08),transparent 30%),"
+                f"{BG}"
+            ),
+            "overflow": "hidden",
+        },
+        children=[
+            _sidebar(),
+            html.Div(
+                style={
+                    "flex": "1",
+                    "minWidth": "0",
+                    "height": "100vh",
+                    "overflow": "hidden",
+                    "display": "flex",
+                    "flexDirection": "column",
+                },
+                children=[
+                    _dashboard_page(),
+                    _logs_page(),
+                    _alerts_page(),
+                ],
+            ),
+            dcc.Interval(
+                id="interval",
+                interval=REFRESH_INTERVAL_MS,
+                n_intervals=0,
+            ),
+            dcc.Store(id="current-page", data="logs"),
+            dcc.Store(id="selected-log-store", data=None),
+            dcc.Store(id="rag-open-store", data=False),
+            dcc.Store(id="rag-generated-store", data=False),
+            dcc.Store(id="feedback-accepted-store", data=False),
+        ],
+    )
+
+
+app.layout = html.Div(
+    children=[
+        dcc.Location(id="auth-location", refresh=False),
+        html.Div(id="auth-content"),
+    ]
 )
+
+
+@app.callback(
+    Output("auth-content", "children"),
+    Input("auth-location", "pathname"),
+)
+def display_authenticated_content(pathname: str | None) -> html.Div:
+    del pathname
+    if session.get("authenticated"):
+        return _authenticated_layout()
+    return _login_page()
+
+
+@app.callback(
+    Output("login-error", "children"),
+    Output("auth-location", "pathname", allow_duplicate=True),
+    Input("login-button", "n_clicks"),
+    State("login-username", "value"),
+    State("login-password", "value"),
+    prevent_initial_call=True,
+)
+def authenticate_user(n_clicks: int, username: str | None, password: str | None) -> tuple[str, Any]:
+    if not n_clicks:
+        raise PreventUpdate
+    if str(username or "").strip() == LOGIN_USERNAME and str(password or "") == LOGIN_PASSWORD:
+        session["authenticated"] = True
+        session["username"] = str(username or "").strip()
+        return "", "/"
+    return "Identifiant ou mot de passe incorrect.", no_update
+
+
+@app.callback(
+    Output("auth-location", "pathname", allow_duplicate=True),
+    Input("logout-button", "n_clicks"),
+    prevent_initial_call=True,
+)
+def logout_user(n_clicks: int) -> str:
+    if not n_clicks:
+        raise PreventUpdate
+    session.clear()
+    return "/login"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
