@@ -32,39 +32,35 @@ class AndroidParser(BaseParser):
     source_name = "android"
 
     def parse(self, data_dir: str) -> Iterator[LogEntry]:
-        # Cherche Android.log ou le premier .log dans le dossier Android/
-        candidates = [
-            os.path.join(data_dir, "Android.log"),
-            os.path.join(data_dir, "Android", "Android.log"),
-        ]
-        # Cherche aussi tous les .log dans Android/
         android_dir = os.path.join(data_dir, "Android")
+        candidates = [os.path.join(data_dir, "Android.log")]
+
+        # Cherche récursivement tous les .log dans Android/ et ses sous-dossiers
         if os.path.isdir(android_dir):
-            for fname in sorted(os.listdir(android_dir)):
-                if fname.endswith(".log"):
-                    candidates.append(os.path.join(android_dir, fname))
+            for root, _, files in os.walk(android_dir):
+                for fname in sorted(files):
+                    if fname.endswith(".log"):
+                        candidates.append(os.path.join(root, fname))
 
         for log_path in candidates:
             if not os.path.isfile(log_path):
                 continue
-            try:
-                with open(log_path, "r", errors="replace") as f:
-                    for line in f:
-                        line = line.rstrip()
-                        if not line:
-                            continue
-                        m = _PATTERN.match(line)
-                        if m:
-                            ts, level_char, component, message = m.groups()
-                            yield LogEntry(
-                                timestamp=_parse_ts(ts),
-                                source="android",
-                                host="android-device",
-                                level=_LEVEL_MAP.get(level_char, "INFO"),
-                                component=component,
-                                message=message,
-                                raw=line,
-                            )
-                return  # premier fichier trouvé suffit
-            except FileNotFoundError:
-                continue
+            issue = os.path.basename(os.path.dirname(log_path))
+            host = f"android-{issue}" if issue.startswith("issue") else "android-device"
+            with open(log_path, "r", errors="replace") as f:
+                for line in f:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    m = _PATTERN.match(line)
+                    if m:
+                        ts, level_char, component, message = m.groups()
+                        yield LogEntry(
+                            timestamp=_parse_ts(ts),
+                            source="android",
+                            host=host,
+                            level=_LEVEL_MAP.get(level_char, "INFO"),
+                            component=component,
+                            message=message,
+                            raw=line,
+                        )
