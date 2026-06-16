@@ -30,7 +30,7 @@ data:
   KAFKA_TOPIC: logs-raw
   REPLAY_SPEED: "50"
   DATA_DIR: /data
-  LOG_SOURCES: linux,ssh,hadoop,supercomputer,android,spark
+  LOG_SOURCES: linux,ssh,hadoop,supercomputer,spark
   DATA_S3_URI: gs://logguardian-datalake-logguardian-497218/raw-logs/
   S3_BUCKET: logguardian-datalake-logguardian-497218
 ---
