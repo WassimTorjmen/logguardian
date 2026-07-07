@@ -1,0 +1,63 @@
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: logguardian-ui-cert
+  namespace: logguardian
+spec:
+  domains:
+    - logguardian.34-8-214-70.nip.io
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: logguardian-ui-backendconfig
+  namespace: logguardian
+spec:
+  iap:
+    enabled: true
+    oauthclientCredentials:
+      secretName: iap-oauth-secret
+  healthCheck:
+    checkIntervalSec: 30
+    port: 8050
+    type: HTTP
+    requestPath: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring-ui-iap
+  namespace: logguardian
+  annotations:
+    cloud.google.com/backend-config: '{"default": "logguardian-ui-backendconfig"}'
+    cloud.google.com/neg: '{"ingress": true}'
+spec:
+  type: ClusterIP
+  selector:
+    app: monitoring-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8050
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: logguardian-ui-ingress
+  namespace: logguardian
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: logguardian-ui-ip
+    networking.gke.io/managed-certificates: logguardian-ui-cert
+    kubernetes.io/ingress.class: gce
+spec:
+  rules:
+    - host: logguardian.34-8-214-70.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: monitoring-ui-iap
+                port:
+                  number: 80

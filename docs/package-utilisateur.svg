@@ -1,0 +1,90 @@
+<svg viewBox="0 0 1200 720" xmlns="http://www.w3.org/2000/svg" font-family="Arial, Helvetica, sans-serif">
+  <rect width="1200" height="720" fill="#ffffff"/>
+
+  <text x="600" y="60" text-anchor="middle" font-size="14" fill="#6b7280" letter-spacing="2">PROJET LOGGUARDIAN</text>
+  <text x="600" y="100" text-anchor="middle" font-size="32" font-weight="500" fill="#111827">Package utilisateur</text>
+  <line x1="520" y1="120" x2="680" y2="120" stroke="#0C447C" stroke-width="2"/>
+  <text x="600" y="148" text-anchor="middle" font-size="14" fill="#6b7280">Tout ce qu'un nouvel utilisateur reçoit pour prendre le projet en main</text>
+
+  <g transform="translate(50,190)">
+    <rect width="540" height="480" rx="14" fill="#ffffff" stroke="#e5e7eb" stroke-width="1"/>
+    <rect x="0" y="0" width="540" height="60" rx="14" fill="#E6F1FB"/>
+    <rect x="0" y="46" width="540" height="14" fill="#E6F1FB"/>
+    <text x="30" y="38" font-size="22" fill="#0C447C">⚙</text>
+    <text x="60" y="38" font-size="20" font-weight="500" fill="#0C447C">Installation &amp; configuration</text>
+
+    <g transform="translate(40,100)" fill="#374151" font-size="14">
+
+      <g transform="translate(0,0)">
+        <circle cx="6" cy="14" r="5" fill="#185FA5"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Prérequis et outils</text>
+        <text x="22" y="40">Docker, Python 3.11, gcloud SDK, kubectl,</text>
+        <text x="22" y="58">Terraform — version et installation détaillées.</text>
+      </g>
+
+      <g transform="translate(0,90)">
+        <circle cx="6" cy="14" r="5" fill="#185FA5"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Installation locale (Docker Compose)</text>
+        <text x="22" y="40">Lancement du stack complet en local pour</text>
+        <text x="22" y="58">développement et tests, en 4 commandes.</text>
+      </g>
+
+      <g transform="translate(0,180)">
+        <circle cx="6" cy="14" r="5" fill="#185FA5"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Déploiement GCP (GKE)</text>
+        <text x="22" y="40">Cluster existant ou setup from scratch via</text>
+        <text x="22" y="58">Terraform — étape par étape.</text>
+      </g>
+
+      <g transform="translate(0,270)">
+        <circle cx="6" cy="14" r="5" fill="#185FA5"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Configuration et secrets</text>
+        <text x="22" y="40">Toutes les variables d'environnement,</text>
+        <text x="22" y="58">ConfigMaps Kubernetes et rotation des clés.</text>
+      </g>
+
+    </g>
+  </g>
+
+  <g transform="translate(610,190)">
+    <rect width="540" height="480" rx="14" fill="#ffffff" stroke="#e5e7eb" stroke-width="1"/>
+    <rect x="0" y="0" width="540" height="60" rx="14" fill="#E1F5EE"/>
+    <rect x="0" y="46" width="540" height="14" fill="#E1F5EE"/>
+    <text x="30" y="38" font-size="22" fill="#0F6E56">📖</text>
+    <text x="60" y="38" font-size="20" font-weight="500" fill="#04342C">Documentation du projet</text>
+
+    <g transform="translate(40,100)" fill="#374151" font-size="14">
+
+      <g transform="translate(0,0)">
+        <circle cx="6" cy="14" r="5" fill="#0F6E56"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Architecture et flux de données</text>
+        <text x="22" y="40">Diagramme global, topics Kafka, choix</text>
+        <text x="22" y="58">techniques et leur justification.</text>
+      </g>
+
+      <g transform="translate(0,90)">
+        <circle cx="6" cy="14" r="5" fill="#0F6E56"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Documentation des services</text>
+        <text x="22" y="40">log-generator, etl, ml-model, monitoring-ui,</text>
+        <text x="22" y="58">email-sender, kafka — un fichier par service.</text>
+      </g>
+
+      <g transform="translate(0,180)">
+        <circle cx="6" cy="14" r="5" fill="#0F6E56"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Modèle ML et réentraînement</text>
+        <text x="22" y="40">Architecture LSTM, features 77 dims,</text>
+        <text x="22" y="58">procédure complète de retraining.</text>
+      </g>
+
+      <g transform="translate(0,270)">
+        <circle cx="6" cy="14" r="5" fill="#0F6E56"/>
+        <text x="22" y="18" font-size="16" font-weight="500" fill="#111827">Opérations et troubleshooting</text>
+        <text x="22" y="40">CI/CD, monitoring, commandes utiles,</text>
+        <text x="22" y="58">problèmes connus et solutions.</text>
+      </g>
+
+    </g>
+  </g>
+
+  <text x="600" y="700" text-anchor="middle" font-size="12" fill="#9ca3af">22 fichiers Markdown organisés en 5 thèmes dans docs/</text>
+</svg>

@@ -1,0 +1,87 @@
+<svg viewBox="0 0 1200 700" xmlns="http://www.w3.org/2000/svg" font-family="Arial, Helvetica, sans-serif">
+  <rect width="1200" height="700" fill="#ffffff"/>
+
+  <text x="600" y="60" text-anchor="middle" font-size="14" fill="#6b7280" letter-spacing="2">PROJET LOGGUARDIAN</text>
+  <text x="600" y="100" text-anchor="middle" font-size="32" font-weight="500" fill="#111827">Répartition des tâches</text>
+  <line x1="500" y1="120" x2="700" y2="120" stroke="#e5e7eb" stroke-width="1"/>
+
+  <g transform="translate(50,170)">
+    <rect width="350" height="460" rx="14" fill="#ffffff" stroke="#e5e7eb" stroke-width="1"/>
+    <circle cx="60" cy="60" r="32" fill="#E6F1FB"/>
+    <text x="60" y="70" text-anchor="middle" font-size="26" font-weight="500" fill="#0C447C">W</text>
+    <text x="110" y="55" font-size="22" font-weight="500" fill="#111827">Wassim</text>
+    <text x="110" y="78" font-size="13" fill="#6b7280">DevOps &amp; Backend</text>
+    <line x1="25" y1="110" x2="325" y2="110" stroke="#f3f4f6" stroke-width="1"/>
+    <g transform="translate(25,145)" fill="#374151" font-size="14">
+      <circle cx="10" cy="-4" r="3" fill="#0C447C"/>
+      <text x="25" y="0">Environnement de</text>
+      <text x="25" y="18">développement</text>
+      <circle cx="10" cy="56" r="3" fill="#0C447C"/>
+      <text x="25" y="60">Services backend</text>
+      <text x="25" y="78">(Kafka, ETL, API)</text>
+      <circle cx="10" cy="116" r="3" fill="#0C447C"/>
+      <text x="25" y="120">Configuration cloud GCP</text>
+      <text x="25" y="138">(GKE, GCS, Artifact Registry)</text>
+      <circle cx="10" cy="176" r="3" fill="#0C447C"/>
+      <text x="25" y="180">Infrastructure as Code</text>
+      <text x="25" y="198">(Terraform)</text>
+      <circle cx="10" cy="236" r="3" fill="#0C447C"/>
+      <text x="25" y="240">CI/CD Cloud Build</text>
+      <text x="25" y="258">&amp; déploiement Kubernetes</text>
+    </g>
+  </g>
+
+  <g transform="translate(425,170)">
+    <rect width="350" height="460" rx="14" fill="#ffffff" stroke="#e5e7eb" stroke-width="1"/>
+    <circle cx="60" cy="60" r="32" fill="#E1F5EE"/>
+    <text x="60" y="70" text-anchor="middle" font-size="26" font-weight="500" fill="#085041">M</text>
+    <text x="110" y="55" font-size="22" font-weight="500" fill="#111827">Maissa</text>
+    <text x="110" y="78" font-size="13" fill="#6b7280">Machine Learning &amp; NLP</text>
+    <line x1="25" y1="110" x2="325" y2="110" stroke="#f3f4f6" stroke-width="1"/>
+    <g transform="translate(25,145)" fill="#374151" font-size="14">
+      <circle cx="10" cy="-4" r="3" fill="#085041"/>
+      <text x="25" y="0">Modèle LSTM Autoencoder</text>
+      <text x="25" y="18">(PyTorch)</text>
+      <circle cx="10" cy="56" r="3" fill="#085041"/>
+      <text x="25" y="60">Pipeline NLP</text>
+      <text x="25" y="78">(tokenisation, embeddings 64d)</text>
+      <circle cx="10" cy="116" r="3" fill="#085041"/>
+      <text x="25" y="120">Feature engineering</text>
+      <text x="25" y="138">(77 dimensions)</text>
+      <circle cx="10" cy="176" r="3" fill="#085041"/>
+      <text x="25" y="180">Entraînement</text>
+      <text x="25" y="198">&amp; calibration du seuil</text>
+      <circle cx="10" cy="236" r="3" fill="#085041"/>
+      <text x="25" y="240">Évaluation</text>
+      <text x="25" y="258">&amp; optimisation du modèle</text>
+    </g>
+  </g>
+
+  <g transform="translate(800,170)">
+    <rect width="350" height="460" rx="14" fill="#ffffff" stroke="#e5e7eb" stroke-width="1"/>
+    <circle cx="60" cy="60" r="32" fill="#FAECE7"/>
+    <text x="60" y="70" text-anchor="middle" font-size="26" font-weight="500" fill="#712B13">E</text>
+    <text x="110" y="55" font-size="22" font-weight="500" fill="#111827">Eya</text>
+    <text x="110" y="78" font-size="13" fill="#6b7280">Frontend &amp; IA explicative</text>
+    <line x1="25" y1="110" x2="325" y2="110" stroke="#f3f4f6" stroke-width="1"/>
+    <g transform="translate(25,145)" fill="#374151" font-size="14">
+      <circle cx="10" cy="-4" r="3" fill="#712B13"/>
+      <text x="25" y="0">Dashboard interactif</text>
+      <text x="25" y="18">(Dash + Plotly)</text>
+      <circle cx="10" cy="56" r="3" fill="#712B13"/>
+      <text x="25" y="60">Design UI / UX</text>
+      <text x="25" y="78">&amp; système d'authentification</text>
+      <circle cx="10" cy="116" r="3" fill="#712B13"/>
+      <text x="25" y="120">Panneau RAG explicatif</text>
+      <text x="25" y="138">(intégration Groq LLM)</text>
+      <circle cx="10" cy="176" r="3" fill="#712B13"/>
+      <text x="25" y="180">Boucle de feedback</text>
+      <text x="25" y="198">utilisateur (JSONL)</text>
+      <circle cx="10" cy="236" r="3" fill="#712B13"/>
+      <text x="25" y="240">Visualisation des anomalies</text>
+      <text x="25" y="258">en temps réel</text>
+    </g>
+  </g>
+
+  <text x="600" y="680" text-anchor="middle" font-size="12" fill="#9ca3af">LogGuardian — AIOps Command Center</text>
+</svg>

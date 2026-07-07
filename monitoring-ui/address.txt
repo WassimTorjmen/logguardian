@@ -1,0 +1,13 @@
+PS D:\ESGI\5ème année\PA\logguardian> gcloud compute addresses describe logguardian-ui-ip --global --project=logguardian-497218
+address: 34.8.214.70
+addressType: EXTERNAL
+creationTimestamp: '2026-07-07T13:32:37.101-07:00'
+description: ''
+id: '5349225850004888714'
+ipVersion: IPV4
+kind: compute#address
+labelFingerprint: 42WmSpB8rSM=
+name: logguardian-ui-ip
+networkTier: PREMIUM
+selfLink: https://www.googleapis.com/compute/v1/projects/logguardian-497218/global/addresses/logguardian-ui-ip
+status: RESERVED

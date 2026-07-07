@@ -1,0 +1,58 @@
+<svg viewBox="0 0 1200 720" xmlns="http://www.w3.org/2000/svg" font-family="Arial, Helvetica, sans-serif">
+  <rect width="1200" height="720" fill="#ffffff"/>
+
+  <text x="600" y="60" text-anchor="middle" font-size="14" fill="#6b7280" letter-spacing="2">PROJET LOGGUARDIAN</text>
+  <text x="600" y="100" text-anchor="middle" font-size="32" font-weight="500" fill="#111827">Améliorations possibles</text>
+  <line x1="510" y1="120" x2="690" y2="120" stroke="#0F6E56" stroke-width="2"/>
+
+  <g transform="translate(100,170)">
+    <rect width="1000" height="500" rx="14" fill="#ffffff" stroke="#e5e7eb" stroke-width="1"/>
+    <rect x="0" y="0" width="1000" height="56" rx="14" fill="#E1F5EE"/>
+    <rect x="0" y="42" width="1000" height="14" fill="#E1F5EE"/>
+    <circle cx="36" cy="28" r="16" fill="#0F6E56"/>
+    <text x="36" y="34" text-anchor="middle" font-size="18" font-weight="500" fill="#ffffff">+</text>
+    <text x="66" y="34" font-size="20" font-weight="500" fill="#04342C">Évolutions envisagées</text>
+
+    <g transform="translate(50,110)">
+
+      <g transform="translate(0,0)">
+        <text x="0" y="0">
+          <tspan font-size="22" fill="#0F6E56">●</tspan>
+        </text>
+        <text x="30" y="0" font-size="17" font-weight="500" fill="#111827">Modèle ML plus robuste</text>
+        <text x="30" y="22" font-size="14" fill="#374151">Seuils adaptatifs par source/host, réentraînement automatisé via Vertex AI sur</text>
+        <text x="30" y="42" font-size="14" fill="#374151">détection de drift, et passage à un modèle multi-tâches (score + classification).</text>
+      </g>
+
+      <g transform="translate(0,110)">
+        <text x="0" y="0">
+          <tspan font-size="22" fill="#0F6E56">●</tspan>
+        </text>
+        <text x="30" y="0" font-size="17" font-weight="500" fill="#111827">Sécurité renforcée</text>
+        <text x="30" y="22" font-size="14" fill="#374151">Identity-Aware Proxy GCP, intégration SSO avec gestion des rôles (RBAC),</text>
+        <text x="30" y="42" font-size="14" fill="#374151">certificats TLS gérés via Cert Manager et chiffrement de bout en bout.</text>
+      </g>
+
+      <g transform="translate(0,220)">
+        <text x="0" y="0">
+          <tspan font-size="22" fill="#0F6E56">●</tspan>
+        </text>
+        <text x="30" y="0" font-size="17" font-weight="500" fill="#111827">Observabilité avancée</text>
+        <text x="30" y="22" font-size="14" fill="#374151">Métriques applicatives Prometheus, tracing distribué OpenTelemetry et</text>
+        <text x="30" y="42" font-size="14" fill="#374151">dashboards Grafana pour suivre la latence et la qualité du modèle.</text>
+      </g>
+
+      <g transform="translate(0,330)">
+        <text x="0" y="0">
+          <tspan font-size="22" fill="#0F6E56">●</tspan>
+        </text>
+        <text x="30" y="0" font-size="17" font-weight="500" fill="#111827">Intégrations alerting étendues</text>
+        <text x="30" y="22" font-size="14" fill="#374151">Connecteurs Slack, Microsoft Teams et PagerDuty en complément des emails,</text>
+        <text x="30" y="42" font-size="14" fill="#374151">avec routage des incidents selon la sévérité et l'équipe d'astreinte.</text>
+      </g>
+
+    </g>
+  </g>
+
+  <text x="600" y="700" text-anchor="middle" font-size="12" fill="#9ca3af">LogGuardian — AIOps Command Center</text>
+</svg>

@@ -1,0 +1,82 @@
+<svg viewBox="0 0 900 780" xmlns="http://www.w3.org/2000/svg" font-family="Arial, Helvetica, sans-serif">
+  <rect width="900" height="780" fill="#ffffff"/>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0F6E56"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#BA7517"/>
+    </marker>
+  </defs>
+
+  <text x="450" y="40" text-anchor="middle" font-size="13" fill="#6b7280" letter-spacing="2">LOGGUARDIAN — PANNEAU ANALYSTE IA</text>
+  <text x="450" y="72" text-anchor="middle" font-size="24" font-weight="500" fill="#111827">Boucle de feedback RAG</text>
+
+  <g transform="translate(350,110)">
+    <rect width="200" height="56" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.2"/>
+    <text x="100" y="34" text-anchor="middle" font-size="15" font-weight="500" fill="#0C447C">Réponse Groq</text>
+  </g>
+  <line x1="450" y1="166" x2="450" y2="200" stroke="#374151" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <g transform="translate(310,200)">
+    <rect width="280" height="56" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.2"/>
+    <text x="140" y="34" text-anchor="middle" font-size="15" font-weight="500" fill="#2C2C2A">Feedback utilisateur</text>
+  </g>
+
+  <line x1="450" y1="256" x2="450" y2="280" stroke="#374151" stroke-width="1.5"/>
+  <line x1="220" y1="280" x2="680" y2="280" stroke="#374151" stroke-width="1.5"/>
+  <line x1="220" y1="280" x2="220" y2="310" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="680" y1="280" x2="680" y2="310" stroke="#BA7517" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+
+  <g transform="translate(120,320)">
+    <rect width="200" height="56" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="1.2"/>
+    <text x="100" y="34" text-anchor="middle" font-size="15" font-weight="500" fill="#04342C">👍  Utile</text>
+  </g>
+  <line x1="220" y1="376" x2="220" y2="410" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <g transform="translate(580,320)">
+    <rect width="200" height="56" rx="10" fill="#FAEEDA" stroke="#BA7517" stroke-width="1.2"/>
+    <text x="100" y="34" text-anchor="middle" font-size="15" font-weight="500" fill="#412402">👎  Pas utile</text>
+  </g>
+  <line x1="680" y1="376" x2="680" y2="410" stroke="#BA7517" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+
+  <g transform="translate(120,420)">
+    <rect width="200" height="60" rx="10" fill="#ffffff" stroke="#0F6E56" stroke-width="1.2"/>
+    <text x="100" y="28" text-anchor="middle" font-size="14" fill="#04342C">Validation</text>
+    <text x="100" y="48" text-anchor="middle" font-size="14" fill="#04342C">+ stockage JSONL</text>
+  </g>
+  <line x1="220" y1="480" x2="220" y2="514" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <g transform="translate(580,420)">
+    <rect width="200" height="60" rx="10" fill="#ffffff" stroke="#BA7517" stroke-width="1.2"/>
+    <text x="100" y="28" text-anchor="middle" font-size="14" fill="#412402">Nouveau prompt</text>
+    <text x="100" y="48" text-anchor="middle" font-size="14" fill="#412402">+ feedback intégré</text>
+  </g>
+  <line x1="680" y1="480" x2="680" y2="514" stroke="#BA7517" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+
+  <g transform="translate(120,524)">
+    <rect width="200" height="50" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.2"/>
+    <text x="100" y="32" text-anchor="middle" font-size="14" font-weight="500" fill="#2C2C2A">Fin</text>
+  </g>
+
+  <g transform="translate(580,524)">
+    <rect width="200" height="56" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.2"/>
+    <text x="100" y="34" text-anchor="middle" font-size="15" font-weight="500" fill="#0C447C">Nouvelle réponse Groq</text>
+  </g>
+  <line x1="680" y1="580" x2="680" y2="614" stroke="#374151" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <g transform="translate(580,624)">
+    <rect width="200" height="50" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.2"/>
+    <text x="100" y="32" text-anchor="middle" font-size="14" font-weight="500" fill="#2C2C2A">Mise à jour de l'interface</text>
+  </g>
+
+  <g transform="translate(100,710)">
+    <rect width="700" height="50" rx="10" fill="#ffffff" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="6 4"/>
+    <text x="350" y="22" text-anchor="middle" font-size="13" font-weight="500" fill="#444441">Fallback : si Groq est indisponible</text>
+    <text x="350" y="40" text-anchor="middle" font-size="13" fill="#5F5E5A">→ une réponse locale est servie en remplacement</text>
+  </g>
+</svg>
