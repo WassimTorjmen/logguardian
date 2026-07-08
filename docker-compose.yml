@@ -132,6 +132,8 @@ services:
       LOGIN_USERNAME: ${LOGIN_USERNAME}
       LOGIN_PASSWORD: ${LOGIN_PASSWORD}
       DASH_SECRET_KEY: ${DASH_SECRET_KEY}
+      MAX_NEGATIVE_FEEDBACKS: ${MAX_NEGATIVE_FEEDBACKS:-5}
+      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-admin@log-guardian.fr}
     volumes:
       - ./feedback:/app/feedback
     restart: on-failure

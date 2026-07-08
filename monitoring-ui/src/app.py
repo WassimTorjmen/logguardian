@@ -105,6 +105,17 @@ LOGIN_PASSWORD = os.getenv(
     "LOGIN_PASSWORD",
     "admin",
 ).strip()
+
+# Nombre maximal de réponses pouvant être rejetées pour un même log.
+# La 5e réponse rejetée clôt la boucle et oriente l'utilisateur vers le support.
+MAX_NEGATIVE_FEEDBACKS = int(
+    os.getenv("MAX_NEGATIVE_FEEDBACKS", "5")
+)
+SUPPORT_EMAIL = os.getenv(
+    "SUPPORT_EMAIL",
+    "admin@log-guardian.fr",
+).strip()
+
 _buffer: deque[dict[str, Any]] = deque(maxlen=MAX_ROWS)
 _lock = threading.Lock()
 _total_received = 0
@@ -304,86 +315,179 @@ app.index_string = f"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root {{
-  --bg:{BG}; --paper:{PAPER}; --border:{BD}; --border-soft:{BD2};
-  --text:{TXT}; --muted:{MUT}; --blue:{BLUE}; --green:{GREEN};
-  --red:{RED}; --orange:{ORAN}; --purple:{PURP};
+  --bg:{BG};--paper:{PAPER};--border:{BD};--border-soft:{BD2};
+  --text:{TXT};--muted:{MUT};--muted2:#94a3b8;
+  --blue:{BLUE};--cyan:{CYAN};--green:{GREEN};--red:{RED};--orange:{ORAN};--purple:{PURP};
+  --shadow-xs:0 1px 4px rgba(15,23,42,.06);
+  --shadow-sm:0 4px 14px rgba(15,23,42,.07);
+  --shadow-md:0 10px 32px rgba(15,23,42,.10);
+  --shadow-lg:0 22px 60px rgba(15,23,42,.13);
+  --shadow-xl:0 36px 90px rgba(15,23,42,.18);
+  --r-sm:10px;--r-md:14px;--r-lg:20px;--r-xl:28px;
+  --ease-out:cubic-bezier(.2,.8,.2,1);
 }}
 *,*::before,*::after{{box-sizing:border-box}}
 html,body{{
   height:100%;margin:0;overflow:hidden;color:var(--text);
   font-family:"Inter",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   background:
-    radial-gradient(circle at 12% 8%,rgba(37,99,235,.10),transparent 27%),
-    radial-gradient(circle at 88% 10%,rgba(139,92,246,.10),transparent 30%),
-    linear-gradient(180deg,#f8faff 0%,var(--bg) 100%);
+    radial-gradient(ellipse 70% 45% at 8% -8%,rgba(37,99,235,.16),transparent),
+    radial-gradient(ellipse 70% 45% at 92% -8%,rgba(139,92,246,.16),transparent),
+    radial-gradient(ellipse 55% 35% at 50% 108%,rgba(14,165,233,.09),transparent),
+    linear-gradient(175deg,#eef3ff 0%,{BG} 100%);
   -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+  text-rendering:optimizeLegibility;
 }}
 button,input{{font-family:inherit}}
-button{{transition:transform .16s ease,box-shadow .16s ease,background .16s ease,border-color .16s ease}}
-button:not(:disabled):hover{{transform:translateY(-1px)}}
-button:not(:disabled):active{{transform:translateY(0)}}
-::selection{{background:rgba(37,99,235,.16)}}
-::-webkit-scrollbar{{width:8px;height:8px}}
+button{{
+  transition:transform .18s var(--ease-out),box-shadow .18s ease,
+    background .15s ease,border-color .15s ease,color .15s ease,opacity .15s ease;
+}}
+button:not(:disabled):hover{{transform:translateY(-2px)}}
+button:not(:disabled):active{{transform:translateY(0) scale(.98)}}
+::selection{{background:rgba(37,99,235,.18)}}
+
+/* ── Scrollbar premium ── */
+::-webkit-scrollbar{{width:5px;height:5px}}
 ::-webkit-scrollbar-track{{background:transparent}}
-::-webkit-scrollbar-thumb{{background:#b8c5d8;border-radius:999px;border:2px solid transparent;background-clip:content-box}}
-.nav-item{{position:relative;overflow:hidden;transition:all .18s ease!important}}
+::-webkit-scrollbar-thumb{{
+  background:linear-gradient(180deg,rgba(37,99,235,.42),rgba(139,92,246,.42));
+  border-radius:999px;
+}}
+::-webkit-scrollbar-thumb:hover{{
+  background:linear-gradient(180deg,rgba(37,99,235,.68),rgba(139,92,246,.68));
+}}
+
+/* ── Sidebar nav ── */
+.nav-item{{position:relative;overflow:hidden;transition:all .22s var(--ease-out)!important}}
 .nav-item::before{{
   content:"";position:absolute;inset:0 auto 0 0;width:3px;
-  background:linear-gradient(180deg,#60a5fa,#8b5cf6);opacity:0;
+  background:linear-gradient(180deg,#60a5fa,#a78bfa);opacity:0;
+  border-radius:0 3px 3px 0;
+  transition:opacity .22s ease!important;
+}}
+.nav-item::after{{
+  content:"";position:absolute;inset:0;opacity:0;pointer-events:none;
+  background:linear-gradient(100deg,rgba(96,165,250,.22),rgba(139,92,246,.10),transparent 72%);
+  transition:opacity .22s ease!important;
 }}
 .nav-item:hover{{
-  background:linear-gradient(90deg,rgba(96,165,250,.14),rgba(139,92,246,.06))!important;
-  border-color:rgba(148,163,184,.16)!important;transform:translateX(2px);
+  border-color:rgba(148,163,184,.30)!important;
+  transform:translateX(4px) scale(1.01)!important;
+  box-shadow:0 6px 28px rgba(37,99,235,.14)!important;
 }}
-.nav-item:hover::before{{opacity:1}}
-.card-hover{{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}}
-.card-hover:hover{{transform:translateY(-3px);box-shadow:0 22px 50px rgba(15,30,80,.12)!important}}
-@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.45}}}}
-.pulse{{animation:pulse 1.9s ease-in-out infinite}}
-@keyframes fadeUp{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:translateY(0)}}}}
-.page-enter{{animation:fadeUp .24s ease both}}
+.nav-item:hover::before,.nav-item:hover::after{{opacity:1}}
 
+/* ── Cards ── */
+.card-hover{{
+  transition:transform .22s var(--ease-out),box-shadow .22s ease,
+    border-color .22s ease!important;
+}}
+.card-hover:hover{{
+  transform:translateY(-6px)!important;
+  box-shadow:0 36px 84px rgba(15,30,80,.16),0 0 0 1px rgba(37,99,235,.11)!important;
+  border-color:rgba(37,99,235,.16)!important;
+}}
+
+/* ── Animations ── */
+@keyframes pulse{{
+  0%,100%{{opacity:1;transform:scale(1)}}
+  50%{{opacity:.3;transform:scale(.72)}}
+}}
+.pulse{{animation:pulse 1.9s ease-in-out infinite}}
+
+@keyframes fadeUp{{
+  from{{opacity:0;transform:translateY(16px)}}
+  to{{opacity:1;transform:none}}
+}}
+.page-enter{{animation:fadeUp .3s var(--ease-out) both}}
+
+@keyframes slideInRight{{
+  from{{opacity:0;transform:translateX(34px) scale(.965)}}
+  to{{opacity:1;transform:none}}
+}}
+.rag-panel-enter{{animation:slideInRight .3s var(--ease-out) both}}
+
+@keyframes liveGlow{{
+  0%,100%{{
+    box-shadow:0 0 0 2px rgba(16,185,129,.18),0 6px 18px rgba(16,185,129,.14);
+  }}
+  50%{{
+    box-shadow:0 0 0 6px rgba(16,185,129,.0),0 6px 24px rgba(16,185,129,.24);
+  }}
+}}
+
+@keyframes floatOrb{{
+  0%,100%{{transform:translateY(0) scale(1)}}
+  50%{{transform:translateY(-12px) scale(1.04)}}
+}}
+
+@keyframes gradientShift{{
+  0%{{background-position:0% 50%}}
+  50%{{background-position:100% 50%}}
+  100%{{background-position:0% 50%}}
+}}
+
+/* ── Dropdown ── */
 .dash-dropdown .Select-control{{
-  height:44px!important;min-height:44px!important;border:1px solid var(--border)!important;
-  border-radius:12px!important;background:rgba(255,255,255,.96)!important;
-  box-shadow:0 4px 12px rgba(15,23,42,.035)!important;
+  height:44px!important;min-height:44px!important;
+  border:1.5px solid var(--border)!important;
+  border-radius:var(--r-sm)!important;
+  background:rgba(255,255,255,.97)!important;
+  box-shadow:var(--shadow-xs),inset 0 1px 0 rgba(255,255,255,.9)!important;
+  transition:border-color .2s,box-shadow .2s!important;
 }}
 .dash-dropdown .Select-control:hover,
 .dash-dropdown .is-focused:not(.is-open)>.Select-control{{
-  border-color:rgba(37,99,235,.42)!important;
-  box-shadow:0 0 0 4px rgba(37,99,235,.08)!important;
+  border-color:rgba(37,99,235,.55)!important;
+  box-shadow:0 0 0 4px rgba(37,99,235,.10),var(--shadow-sm)!important;
 }}
 .dash-dropdown .Select-placeholder,.dash-dropdown .Select-value-label{{
-  line-height:42px!important;font-size:12px!important;font-weight:600!important;color:var(--muted)!important;
+  line-height:42px!important;font-size:12px!important;
+  font-weight:600!important;color:var(--muted)!important;
 }}
 .dash-dropdown .Select-menu-outer{{
-  z-index:9999!important;border:1px solid var(--border)!important;border-radius:14px!important;
-  overflow:hidden;box-shadow:0 18px 45px rgba(15,23,42,.14)!important;
+  z-index:9999!important;border:1.5px solid var(--border)!important;
+  border-radius:var(--r-md)!important;overflow:hidden;
+  box-shadow:var(--shadow-xl)!important;margin-top:7px!important;
 }}
-.dash-dropdown .VirtualizedSelectOption{{font-size:12px!important;padding:10px 12px!important}}
-.dash-dropdown .VirtualizedSelectFocusedOption{{background:#eff6ff!important;color:var(--blue)!important}}
+.dash-dropdown .VirtualizedSelectOption{{font-size:12px!important;padding:10px 14px!important}}
+.dash-dropdown .VirtualizedSelectFocusedOption{{
+  background:linear-gradient(90deg,#eff6ff,#f5f0ff)!important;
+  color:var(--blue)!important;
+}}
 
+/* ── Table ── */
 .dash-table-container,.dash-spreadsheet-container,.dash-spreadsheet-inner{{
   width:100%!important;max-width:100%!important;
 }}
 .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr:hover td{{
-  background:linear-gradient(90deg,#eff6ff,#f8fbff)!important;cursor:pointer;
+  background:linear-gradient(90deg,#eff6ff,#f5f2ff 55%,#eef5ff)!important;cursor:pointer;
 }}
 .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td[data-active=true]{{
-  background:linear-gradient(90deg,#dbeafe,#eef6ff)!important;outline:none!important;
-  box-shadow:inset 3px 0 0 var(--blue),inset 0 0 0 1px rgba(37,99,235,.16)!important;
+  background:linear-gradient(90deg,#dbeafe,#ede9fe 55%,#eef4ff)!important;
+  outline:none!important;
+  box-shadow:inset 3px 0 0 {BLUE},inset 0 0 0 1px rgba(37,99,235,.12)!important;
 }}
 .dash-table-container .previous-next-container{{
-  padding:12px 14px!important;border-top:1px solid var(--border-soft);background:#fbfdff;
+  padding:12px 16px!important;border-top:1px solid var(--border-soft);
+  background:linear-gradient(180deg,#fafcff,#f4f8fe);
 }}
-.rag-panel-enter{{animation:ragIn .24s cubic-bezier(.2,.8,.2,1) both}}
-@keyframes ragIn{{from{{opacity:0;transform:translateX(22px) scale(.985)}}to{{opacity:1;transform:none}}}}
 
+/* ── Input focus ── */
+input[type=text]:focus,input[type=password]:focus{{
+  outline:none!important;
+  border-color:rgba(37,99,235,.55)!important;
+  box-shadow:0 0 0 4px rgba(37,99,235,.10)!important;
+}}
+
+/* ── Responsive ── */
 @media(max-width:1180px){{
   .responsive-sidebar{{width:220px!important;min-width:220px!important}}
 }}
 @media(max-width:980px){{
-  .responsive-sidebar{{width:86px!important;min-width:86px!important}}
+  .responsive-sidebar{{width:88px!important;min-width:88px!important}}
   .sidebar-text{{display:none!important}}
 }}
 </style>
@@ -420,42 +524,49 @@ def _badge(text: str, color: str, background: str | None = None) -> html.Span:
 def _topbar(title: str, subtitle: str, clock_id: str) -> html.Div:
     return html.Div(
         style={
-            "height": "76px",
-            "minHeight": "76px",
+            "height": "72px",
+            "minHeight": "72px",
             "display": "flex",
             "alignItems": "center",
             "justifyContent": "space-between",
             "padding": "0 28px",
-            "background": "rgba(255,255,255,.76)",
-            "backdropFilter": "blur(18px)",
-            "WebkitBackdropFilter": "blur(18px)",
+            "background": "rgba(255,255,255,.82)",
+            "backdropFilter": "blur(24px)",
+            "WebkitBackdropFilter": "blur(24px)",
             "borderBottom": f"1px solid {BD}",
-            "boxShadow": "0 8px 28px rgba(15,23,42,.035)",
+            "boxShadow": "0 1px 0 rgba(255,255,255,.9),0 6px 24px rgba(15,23,42,.042)",
             "flexShrink": "0",
             "zIndex": "5",
+            "position": "relative",
         },
         children=[
-            html.Div([
-                html.Div(
-                    title,
-                    style={
-                        "fontSize": "23px",
-                        "fontWeight": "900",
-                        "color": TXT,
-                        "letterSpacing": "-.04em",
-                        "lineHeight": "1.05",
-                    },
-                ),
-                html.Div(
-                    subtitle,
-                    style={
-                        "fontSize": "11px",
-                        "fontWeight": "500",
-                        "color": MUT,
-                        "marginTop": "6px",
-                    },
-                ),
-            ]),
+            html.Div(
+                style={"display": "flex", "flexDirection": "column", "gap": "4px"},
+                children=[
+                    html.Div(
+                        title,
+                        style={
+                            "fontSize": "22px",
+                            "fontWeight": "900",
+                            "letterSpacing": "-.045em",
+                            "lineHeight": "1.1",
+                            "background": "linear-gradient(135deg,#0f172a 0%,#1e40af 100%)",
+                            "WebkitBackgroundClip": "text",
+                            "WebkitTextFillColor": "transparent",
+                            "backgroundClip": "text",
+                        },
+                    ),
+                    html.Div(
+                        subtitle,
+                        style={
+                            "fontSize": "11px",
+                            "fontWeight": "500",
+                            "color": MUT,
+                            "letterSpacing": ".01em",
+                        },
+                    ),
+                ],
+            ),
             html.Div(
                 style={"display": "flex", "alignItems": "center", "gap": "10px"},
                 children=[
@@ -463,16 +574,16 @@ def _topbar(title: str, subtitle: str, clock_id: str) -> html.Div:
                         style={
                             "display": "flex",
                             "alignItems": "center",
-                            "gap": "7px",
+                            "gap": "8px",
                             "color": GREEN,
-                            "background": "linear-gradient(180deg,#f0fdf4,#ecfdf5)",
-                            "border": "1px solid #bbf7d0",
+                            "background": "linear-gradient(180deg,#f0fdf4,#dcfce7)",
+                            "border": "1.5px solid #86efac",
                             "borderRadius": "999px",
-                            "padding": "7px 12px",
+                            "padding": "7px 14px",
                             "fontSize": "10px",
                             "fontWeight": "900",
-                            "letterSpacing": ".08em",
-                            "boxShadow": "0 5px 16px rgba(16,185,129,.10)",
+                            "letterSpacing": ".10em",
+                            "animation": "liveGlow 2.4s ease-in-out infinite",
                         },
                         children=[
                             html.Span(
@@ -482,7 +593,8 @@ def _topbar(title: str, subtitle: str, clock_id: str) -> html.Div:
                                     "height": "7px",
                                     "display": "inline-block",
                                     "borderRadius": "50%",
-                                    "background": GREEN,
+                                    "background": "linear-gradient(135deg,#34d399,#10b981)",
+                                    "boxShadow": "0 0 0 3px rgba(16,185,129,.18)",
                                 },
                             ),
                             html.Span("LIVE"),
@@ -493,16 +605,27 @@ def _topbar(title: str, subtitle: str, clock_id: str) -> html.Div:
                         style={
                             "fontFamily": "JetBrains Mono, monospace",
                             "fontSize": "10px",
-                            "fontWeight": "600",
+                            "fontWeight": "700",
                             "color": MUT,
-                            "background": "#f8fafc",
-                            "border": f"1px solid {BD}",
-                            "padding": "9px 12px",
-                            "borderRadius": "11px",
-                            "boxShadow": "0 5px 16px rgba(15,23,42,.04)",
+                            "background": "linear-gradient(180deg,#ffffff,#f8fafc)",
+                            "border": f"1.5px solid {BD}",
+                            "padding": "8px 13px",
+                            "borderRadius": "12px",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.05),inset 0 1px 0 rgba(255,255,255,.9)",
                         },
                     ),
                 ],
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "bottom": "0",
+                    "left": "0",
+                    "right": "0",
+                    "height": "2px",
+                    "background": "linear-gradient(90deg,transparent 0%,rgba(96,165,250,.5) 25%,rgba(167,139,250,.6) 50%,rgba(96,165,250,.5) 75%,transparent 100%)",
+                    "opacity": ".6",
+                }
             ),
         ],
     )
@@ -636,10 +759,10 @@ def _sidebar() -> html.Div:
                             html.Div(
                                 "◈",
                                 style={
-                                    "width": "48px",
-                                    "height": "48px",
-                                    "minWidth": "48px",
-                                    "borderRadius": "20px",
+                                    "width": "50px",
+                                    "height": "50px",
+                                    "minWidth": "50px",
+                                    "borderRadius": "18px",
                                     "display": "grid",
                                     "placeItems": "center",
                                     "fontSize": "24px",
@@ -648,13 +771,13 @@ def _sidebar() -> html.Div:
                                         "linear-gradient("
                                         "135deg,"
                                         "#60a5fa 0%,"
-                                        "#2563eb 52%,"
+                                        "#3b82f6 40%,"
                                         "#7c3aed 100%"
                                         ")"
                                     ),
                                     "boxShadow": (
-                                        "0 14px 34px "
-                                        "rgba(37,99,235,.42)"
+                                        "0 16px 38px rgba(37,99,235,.48),"
+                                        "inset 0 1px 0 rgba(255,255,255,.22)"
                                     ),
                                 },
                             ),
@@ -1097,23 +1220,23 @@ def _metric_card(label: str, value_id: str, accent: str, icon: str, hint: str) -
         style={
             "position": "relative",
             "overflow": "hidden",
-            "background": "linear-gradient(145deg,rgba(255,255,255,.99),rgba(248,251,255,.96))",
-            "border": f"1px solid {BD}",
-            "borderRadius": "20px",
-            "padding": "18px 20px",
-            "boxShadow": "0 10px 30px rgba(15,30,80,.07)",
-            "minHeight": "130px",
+            "background": f"linear-gradient(145deg,rgba(255,255,255,1),{accent}07 100%)",
+            "border": f"1.5px solid {BD}",
+            "borderRadius": "22px",
+            "padding": "20px 22px 22px",
+            "boxShadow": "0 8px 32px rgba(15,30,80,.08),inset 0 1px 0 rgba(255,255,255,.9)",
+            "minHeight": "138px",
         },
         children=[
             html.Div(
                 style={
                     "position": "absolute",
-                    "width": "92px",
-                    "height": "92px",
+                    "width": "110px",
+                    "height": "110px",
                     "borderRadius": "50%",
-                    "right": "-34px",
-                    "top": "-34px",
-                    "background": f"{accent}16",
+                    "right": "-42px",
+                    "top": "-42px",
+                    "background": f"radial-gradient(circle,{accent}20,{accent}06 60%,transparent)",
                 }
             ),
             html.Div(
@@ -1121,21 +1244,22 @@ def _metric_card(label: str, value_id: str, accent: str, icon: str, hint: str) -
                     "display": "flex",
                     "justifyContent": "space-between",
                     "alignItems": "center",
-                    "marginBottom": "15px",
+                    "marginBottom": "16px",
                     "position": "relative",
                 },
                 children=[
                     html.Div(
                         icon,
                         style={
-                            "width": "38px",
-                            "height": "38px",
+                            "width": "42px",
+                            "height": "42px",
                             "display": "grid",
                             "placeItems": "center",
-                            "borderRadius": "12px",
-                            "fontSize": "18px",
-                            "background": f"{accent}14",
-                            "border": f"1px solid {accent}22",
+                            "borderRadius": "14px",
+                            "fontSize": "20px",
+                            "background": f"linear-gradient(135deg,{accent}1e,{accent}0e)",
+                            "border": f"1.5px solid {accent}2e",
+                            "boxShadow": f"0 8px 20px {accent}22",
                         },
                     ),
                     html.Span(
@@ -1144,12 +1268,12 @@ def _metric_card(label: str, value_id: str, accent: str, icon: str, hint: str) -
                             "fontSize": "8px",
                             "fontWeight": "900",
                             "color": accent,
-                            "background": f"{accent}10",
-                            "border": f"1px solid {accent}1f",
+                            "background": f"linear-gradient(135deg,{accent}14,{accent}0a)",
+                            "border": f"1.5px solid {accent}28",
                             "borderRadius": "999px",
-                            "padding": "5px 8px",
+                            "padding": "5px 9px",
                             "fontFamily": "JetBrains Mono, monospace",
-                            "letterSpacing": ".08em",
+                            "letterSpacing": ".09em",
                         },
                     ),
                 ],
@@ -1158,11 +1282,11 @@ def _metric_card(label: str, value_id: str, accent: str, icon: str, hint: str) -
                 id=value_id,
                 children="0",
                 style={
-                    "fontSize": "31px",
+                    "fontSize": "34px",
                     "fontWeight": "900",
                     "color": TXT,
                     "fontFamily": "JetBrains Mono, monospace",
-                    "letterSpacing": "-.045em",
+                    "letterSpacing": "-.05em",
                     "lineHeight": "1",
                     "marginBottom": "8px",
                     "position": "relative",
@@ -1175,7 +1299,7 @@ def _metric_card(label: str, value_id: str, accent: str, icon: str, hint: str) -
                     "fontWeight": "800",
                     "color": MUT,
                     "textTransform": "uppercase",
-                    "letterSpacing": ".09em",
+                    "letterSpacing": ".10em",
                     "position": "relative",
                 },
             ),
@@ -1185,8 +1309,9 @@ def _metric_card(label: str, value_id: str, accent: str, icon: str, hint: str) -
                     "left": "0",
                     "bottom": "0",
                     "width": "100%",
-                    "height": "3px",
-                    "background": f"linear-gradient(90deg,{accent},{accent}22 60%,transparent)",
+                    "height": "4px",
+                    "background": f"linear-gradient(90deg,{accent},{accent}88 35%,{accent}22 65%,transparent)",
+                    "borderRadius": "0 0 22px 22px",
                 }
             ),
         ],
@@ -1198,31 +1323,33 @@ def _panel(title: str, children: Any) -> html.Div:
     return html.Div(
         className="card-hover",
         style={
-            "background": "rgba(255,255,255,.92)",
-            "border": f"1px solid {BD}",
-            "borderRadius": "20px",
+            "background": "rgba(255,255,255,.95)",
+            "border": f"1.5px solid {BD}",
+            "borderRadius": "22px",
             "overflow": "hidden",
-            "boxShadow": "0 12px 34px rgba(15,30,80,.065)",
-            "backdropFilter": "blur(10px)",
+            "boxShadow": "0 10px 36px rgba(15,30,80,.075),inset 0 1px 0 rgba(255,255,255,.9)",
+            "backdropFilter": "blur(12px)",
+            "WebkitBackdropFilter": "blur(12px)",
         },
         children=[
             html.Div(
                 style={
-                    "padding": "15px 17px",
+                    "padding": "14px 18px",
                     "borderBottom": f"1px solid {BD2}",
                     "display": "flex",
                     "alignItems": "center",
-                    "gap": "9px",
-                    "background": "linear-gradient(180deg,#ffffff,#fbfdff)",
+                    "gap": "10px",
+                    "background": "linear-gradient(180deg,rgba(255,255,255,1),rgba(248,251,255,.7))",
                 },
                 children=[
                     html.Span(
                         style={
                             "width": "8px",
                             "height": "8px",
+                            "flexShrink": "0",
                             "borderRadius": "50%",
-                            "background": "linear-gradient(135deg,#60a5fa,#8b5cf6)",
-                            "boxShadow": "0 0 0 4px rgba(37,99,235,.08)",
+                            "background": "linear-gradient(135deg,#60a5fa,#a78bfa)",
+                            "boxShadow": "0 0 0 3px rgba(96,165,250,.16),0 0 0 6px rgba(96,165,250,.06)",
                         }
                     ),
                     html.Span(
@@ -1232,12 +1359,13 @@ def _panel(title: str, children: Any) -> html.Div:
                             "fontWeight": "900",
                             "color": MUT,
                             "textTransform": "uppercase",
-                            "letterSpacing": ".09em",
+                            "letterSpacing": ".11em",
+                            "fontFamily": "JetBrains Mono, monospace",
                         },
                     ),
                 ],
             ),
-            html.Div(style={"padding": "15px"}, children=children),
+            html.Div(style={"padding": "16px"}, children=children),
         ],
     )
 
@@ -1675,18 +1803,24 @@ def _feedback_button_style(
 
 def _rag_block(title: str, component_id: str, accent: str, initial_text: str) -> html.Div:
     return html.Div(
-        style={"marginBottom": "13px"},
+        style={"marginBottom": "14px"},
         children=[
             html.Div(
-                style={"display": "flex", "alignItems": "center", "gap": "7px", "marginBottom": "7px"},
+                style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "gap": "8px",
+                    "marginBottom": "8px",
+                },
                 children=[
                     html.Span(
                         style={
-                            "width": "6px",
-                            "height": "6px",
+                            "width": "7px",
+                            "height": "7px",
                             "borderRadius": "50%",
-                            "background": accent,
-                            "boxShadow": f"0 0 0 4px {accent}1c",
+                            "background": f"linear-gradient(135deg,{accent},{accent}aa)",
+                            "boxShadow": f"0 0 0 3px {accent}22,0 0 0 6px {accent}0c",
+                            "flexShrink": "0",
                         }
                     ),
                     html.Div(
@@ -1694,9 +1828,9 @@ def _rag_block(title: str, component_id: str, accent: str, initial_text: str) ->
                         style={
                             "fontSize": "9px",
                             "fontWeight": "900",
-                            "color": "#91a4c8",
+                            "color": "#8da4c8",
                             "textTransform": "uppercase",
-                            "letterSpacing": ".11em",
+                            "letterSpacing": ".13em",
                             "fontFamily": "JetBrains Mono, monospace",
                         },
                     ),
@@ -1706,17 +1840,18 @@ def _rag_block(title: str, component_id: str, accent: str, initial_text: str) ->
                 id=component_id,
                 children=initial_text,
                 style={
-                    "background": "linear-gradient(145deg,rgba(255,255,255,.075),rgba(255,255,255,.045))",
-                    "border": "1px solid rgba(148,163,184,.14)",
+                    "background": f"linear-gradient(145deg,rgba(255,255,255,.08),rgba(255,255,255,.04))",
+                    "border": "1px solid rgba(148,163,184,.16)",
                     "borderLeft": f"3px solid {accent}",
-                    "borderRadius": "14px",
-                    "padding": "12px 13px",
+                    "borderRadius": "16px",
+                    "padding": "13px 14px",
                     "fontSize": "12px",
                     "fontWeight": "500",
-                    "lineHeight": "1.66",
-                    "color": "#dde7f7",
+                    "lineHeight": "1.68",
+                    "color": "#d8e4f5",
                     "whiteSpace": "normal",
                     "overflowWrap": "anywhere",
+                    "boxShadow": f"inset 0 1px 0 rgba(255,255,255,.05),0 2px 8px rgba(0,0,0,.08)",
                 },
             ),
         ],
@@ -1734,15 +1869,16 @@ def _rag_side_panel() -> html.Div:
             "overflowY": "auto",
             "overflowX": "hidden",
             "background": (
-                "radial-gradient(circle at 85% 0%,rgba(124,58,237,.22),transparent 28%),"
-                "radial-gradient(circle at 0% 55%,rgba(14,165,233,.12),transparent 30%),"
-                "linear-gradient(170deg,#071225 0%,#0d1b34 52%,#101b33 100%)"
+                "radial-gradient(ellipse 60% 40% at 90% -5%,rgba(139,92,246,.28),transparent),"
+                "radial-gradient(ellipse 50% 40% at -5% 60%,rgba(14,165,233,.16),transparent),"
+                "radial-gradient(ellipse 40% 30% at 40% 105%,rgba(37,99,235,.14),transparent),"
+                "linear-gradient(170deg,#060f22 0%,#0b1830 55%,#0e1c35 100%)"
             ),
-            "border": "1px solid rgba(148,163,184,.13)",
-            "borderRadius": "20px",
-            "padding": "18px",
+            "border": "1.5px solid rgba(148,163,184,.14)",
+            "borderRadius": "22px",
+            "padding": "20px",
             "color": "white",
-            "boxShadow": "0 24px 60px rgba(7,18,37,.32)",
+            "boxShadow": "0 28px 72px rgba(4,12,28,.42),inset 0 1px 0 rgba(255,255,255,.06)",
         },
         children=[
             html.Div(
@@ -1750,34 +1886,49 @@ def _rag_side_panel() -> html.Div:
                     "display": "flex",
                     "justifyContent": "space-between",
                     "alignItems": "flex-start",
-                    "marginBottom": "16px",
+                    "marginBottom": "18px",
                 },
                 children=[
                     html.Div([
                         html.Div(
-                            style={"display": "flex", "alignItems": "center", "gap": "9px"},
+                            style={"display": "flex", "alignItems": "center", "gap": "11px"},
                             children=[
                                 html.Div(
                                     "✦",
                                     style={
-                                        "width": "34px",
-                                        "height": "34px",
+                                        "width": "38px",
+                                        "height": "38px",
                                         "display": "grid",
                                         "placeItems": "center",
-                                        "borderRadius": "11px",
-                                        "background": "linear-gradient(135deg,#8b5cf6,#2563eb)",
-                                        "boxShadow": "0 10px 24px rgba(99,102,241,.30)",
+                                        "borderRadius": "13px",
+                                        "fontSize": "17px",
+                                        "background": "linear-gradient(135deg,#a78bfa,#6366f1,#2563eb)",
+                                        "boxShadow": "0 12px 28px rgba(99,102,241,.38),inset 0 1px 0 rgba(255,255,255,.15)",
                                     },
                                 ),
                                 html.Div(
                                     "Analyste IA",
-                                    style={"fontSize": "17px", "fontWeight": "900", "letterSpacing": "-.025em"},
+                                    style={
+                                        "fontSize": "18px",
+                                        "fontWeight": "900",
+                                        "letterSpacing": "-.03em",
+                                        "background": "linear-gradient(135deg,#fff 0%,#c4b5fd 100%)",
+                                        "WebkitBackgroundClip": "text",
+                                        "WebkitTextFillColor": "transparent",
+                                        "backgroundClip": "text",
+                                    },
                                 ),
                             ],
                         ),
                         html.Div(
                             "Analyse contextualisée · recommandation · feedback",
-                            style={"fontSize": "9px", "fontWeight": "600", "color": "#7f94bb", "marginTop": "7px"},
+                            style={
+                                "fontSize": "9px",
+                                "fontWeight": "600",
+                                "color": "#7090b8",
+                                "marginTop": "8px",
+                                "letterSpacing": ".04em",
+                            },
                         ),
                     ]),
                     html.Div(
@@ -1790,14 +1941,18 @@ def _rag_side_panel() -> html.Div:
                                 n_clicks=0,
                                 title="Fermer",
                                 style={
-                                    "width": "32px",
-                                    "height": "32px",
-                                    "borderRadius": "10px",
-                                    "border": "1px solid rgba(255,255,255,.14)",
-                                    "background": "rgba(255,255,255,.06)",
-                                    "color": "#cbd5e1",
-                                    "fontSize": "18px",
+                                    "width": "34px",
+                                    "height": "34px",
+                                    "borderRadius": "11px",
+                                    "border": "1px solid rgba(255,255,255,.16)",
+                                    "background": "rgba(255,255,255,.07)",
+                                    "color": "#94a3b8",
+                                    "fontSize": "20px",
                                     "cursor": "pointer",
+                                    "lineHeight": "1",
+                                    "display": "grid",
+                                    "placeItems": "center",
+                                    "transition": "all .18s ease",
                                 },
                             ),
                         ],
@@ -1805,66 +1960,72 @@ def _rag_side_panel() -> html.Div:
                 ],
             ),
             html.Div(
-                style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px", "marginBottom": "15px"},
+                style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px", "marginBottom": "16px"},
                 children=[
                     html.Div(
                         style={
-                            "background": "linear-gradient(145deg,rgba(139,92,246,.16),rgba(255,255,255,.045))",
-                            "border": "1px solid rgba(196,181,253,.18)",
-                            "borderRadius": "15px",
-                            "padding": "13px",
+                            "background": "linear-gradient(145deg,rgba(139,92,246,.20),rgba(99,102,241,.08))",
+                            "border": "1.5px solid rgba(196,181,253,.22)",
+                            "borderRadius": "16px",
+                            "padding": "14px",
+                            "boxShadow": "inset 0 1px 0 rgba(255,255,255,.06)",
                         },
                         children=[
                             html.Div(
                                 "Score IA",
                                 style={
                                     "fontSize": "8px",
-                                    "color": "#9aaed2",
+                                    "color": "#8daad2",
                                     "fontWeight": "900",
                                     "textTransform": "uppercase",
-                                    "letterSpacing": ".10em",
+                                    "letterSpacing": ".12em",
+                                    "fontFamily": "JetBrains Mono, monospace",
                                 },
                             ),
                             html.Div(
                                 id="rag-score",
                                 children="—",
                                 style={
-                                    "fontSize": "25px",
+                                    "fontSize": "28px",
                                     "fontWeight": "900",
                                     "fontFamily": "JetBrains Mono, monospace",
                                     "color": "#c4b5fd",
-                                    "marginTop": "7px",
+                                    "marginTop": "8px",
+                                    "letterSpacing": "-.03em",
                                 },
                             ),
                         ],
                     ),
                     html.Div(
                         style={
-                            "background": "linear-gradient(145deg,rgba(249,115,22,.15),rgba(255,255,255,.045))",
-                            "border": "1px solid rgba(253,186,116,.18)",
-                            "borderRadius": "15px",
-                            "padding": "13px",
+                            "background": "linear-gradient(145deg,rgba(249,115,22,.18),rgba(234,88,12,.08))",
+                            "border": "1.5px solid rgba(253,186,116,.22)",
+                            "borderRadius": "16px",
+                            "padding": "14px",
+                            "boxShadow": "inset 0 1px 0 rgba(255,255,255,.06)",
                         },
                         children=[
                             html.Div(
                                 "Ratio",
                                 style={
                                     "fontSize": "8px",
-                                    "color": "#9aaed2",
+                                    "color": "#8daad2",
                                     "fontWeight": "900",
                                     "textTransform": "uppercase",
-                                    "letterSpacing": ".10em",
+                                    "letterSpacing": ".12em",
+                                    "fontFamily": "JetBrains Mono, monospace",
                                 },
                             ),
                             html.Div(
                                 id="rag-ratio",
                                 children="—",
                                 style={
-                                    "fontSize": "25px",
+                                    "fontSize": "28px",
                                     "fontWeight": "900",
                                     "fontFamily": "JetBrains Mono, monospace",
                                     "color": "#fdba74",
-                                    "marginTop": "7px",
+                                    "marginTop": "8px",
+                                    "letterSpacing": "-.03em",
                                 },
                             ),
                         ],
@@ -1875,28 +2036,54 @@ def _rag_side_panel() -> html.Div:
             _rag_block("Analyse IA", "rag-analysis", "#a78bfa", "Cliquez sur « Analyser avec l’IA »."),
             _rag_block("Action recommandée", "rag-action", "#34d399", "La recommandation apparaîtra après l’analyse."),
             html.Div(
-                style={"paddingTop": "14px", "borderTop": "1px solid rgba(148,163,184,.12)"},
+                style={
+                    "paddingTop": "16px",
+                    "borderTop": "1px solid rgba(148,163,184,.14)",
+                    "marginTop": "4px",
+                },
                 children=[
                     html.Div(
                         style={
                             "display": "flex",
                             "alignItems": "center",
                             "justifyContent": "space-between",
-                            "marginBottom": "10px",
+                            "marginBottom": "11px",
                         },
                         children=[
                             html.Div(
-                                "Feedback utilisateur",
+                                style={"display": "flex", "alignItems": "center", "gap": "7px"},
+                                children=[
+                                    html.Span(
+                                        style={
+                                            "width": "6px",
+                                            "height": "6px",
+                                            "borderRadius": "50%",
+                                            "background": "linear-gradient(135deg,#60a5fa,#a78bfa)",
+                                            "flexShrink": "0",
+                                        }
+                                    ),
+                                    html.Div(
+                                        "Feedback utilisateur",
+                                        style={
+                                            "fontSize": "9px",
+                                            "fontWeight": "900",
+                                            "color": "#8fa3c7",
+                                            "textTransform": "uppercase",
+                                            "letterSpacing": ".12em",
+                                            "fontFamily": "JetBrains Mono, monospace",
+                                        },
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                "améliore le modèle",
                                 style={
-                                    "fontSize": "9px",
-                                    "fontWeight": "900",
-                                    "color": "#8fa3c7",
-                                    "textTransform": "uppercase",
-                                    "letterSpacing": ".10em",
-                                    "fontFamily": "JetBrains Mono, monospace",
+                                    "fontSize": "8px",
+                                    "color": "#4a6080",
+                                    "fontWeight": "600",
+                                    "letterSpacing": ".04em",
                                 },
                             ),
-                            html.Div("Aide à améliorer les réponses", style={"fontSize": "8px", "color": "#60779d"}),
                         ],
                     ),
                     html.Div(
@@ -1930,13 +2117,14 @@ def _rag_side_panel() -> html.Div:
                         style={
                             "fontSize": "10px",
                             "fontWeight": "500",
-                            "color": "#8da1c5",
+                            "color": "#7d98be",
                             "marginTop": "10px",
-                            "lineHeight": "1.55",
-                            "padding": "9px 10px",
-                            "borderRadius": "10px",
-                            "background": "rgba(255,255,255,.035)",
-                            "border": "1px solid rgba(148,163,184,.08)",
+                            "lineHeight": "1.6",
+                            "padding": "10px 12px",
+                            "borderRadius": "12px",
+                            "background": "rgba(255,255,255,.04)",
+                            "border": "1px solid rgba(148,163,184,.10)",
+                            "boxShadow": "inset 0 1px 0 rgba(255,255,255,.05)",
                         },
                     ),
                 ],
@@ -2239,9 +2427,10 @@ def _alerts_page() -> html.Div:
                     html.Div(
                         style={
                             "background": PAPER,
-                            "border": f"1px solid {BD}",
-                            "borderRadius": "16px",
+                            "border": f"1.5px solid {BD}",
+                            "borderRadius": "22px",
                             "overflow": "hidden",
+                            "boxShadow": "0 8px 32px rgba(15,30,80,.07),inset 0 1px 0 rgba(255,255,255,.9)",
                         },
                         children=[
                             dash_table.DataTable(
@@ -2302,82 +2491,172 @@ def _login_page() -> html.Div:
             "display": "grid",
             "placeItems": "center",
             "padding": "24px",
+            "position": "relative",
+            "overflow": "hidden",
             "background": (
-                "radial-gradient(circle at 15% 10%,"
-                "rgba(37,99,235,.24),transparent 30%),"
-                "radial-gradient(circle at 85% 15%,"
-                "rgba(139,92,246,.22),transparent 32%),"
-                "linear-gradient(145deg,#071225,#0c1b36)"
+                "radial-gradient(ellipse 70% 50% at 15% 10%,rgba(37,99,235,.28),transparent),"
+                "radial-gradient(ellipse 65% 50% at 85% 15%,rgba(139,92,246,.26),transparent),"
+                "radial-gradient(ellipse 50% 40% at 50% 95%,rgba(14,165,233,.18),transparent),"
+                "linear-gradient(150deg,#050e1f 0%,#070f22 40%,#0a1530 100%)"
             ),
         },
         children=[
+            # Décorations flottantes en arrière-plan
             html.Div(
                 style={
+                    "position": "absolute",
+                    "width": "500px",
+                    "height": "500px",
+                    "borderRadius": "50%",
+                    "border": "1px solid rgba(96,165,250,.08)",
+                    "top": "50%",
+                    "left": "50%",
+                    "transform": "translate(-50%,-50%)",
+                    "pointerEvents": "none",
+                }
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "700px",
+                    "height": "700px",
+                    "borderRadius": "50%",
+                    "border": "1px solid rgba(96,165,250,.05)",
+                    "top": "50%",
+                    "left": "50%",
+                    "transform": "translate(-50%,-50%)",
+                    "pointerEvents": "none",
+                }
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "280px",
+                    "height": "280px",
+                    "borderRadius": "50%",
+                    "background": "radial-gradient(circle,rgba(139,92,246,.14),transparent 70%)",
+                    "filter": "blur(40px)",
+                    "top": "15%",
+                    "right": "12%",
+                    "pointerEvents": "none",
+                    "animation": "floatOrb 8s ease-in-out infinite",
+                }
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "200px",
+                    "height": "200px",
+                    "borderRadius": "50%",
+                    "background": "radial-gradient(circle,rgba(37,99,235,.16),transparent 70%)",
+                    "filter": "blur(32px)",
+                    "bottom": "20%",
+                    "left": "14%",
+                    "pointerEvents": "none",
+                    "animation": "floatOrb 10s ease-in-out infinite reverse",
+                }
+            ),
+            # Carte de connexion
+            html.Div(
+                style={
+                    "position": "relative",
+                    "zIndex": "2",
                     "width": "100%",
-                    "maxWidth": "430px",
-                    "padding": "34px",
-                    "borderRadius": "24px",
-                    "background": "rgba(255,255,255,.97)",
-                    "border": "1px solid rgba(255,255,255,.30)",
+                    "maxWidth": "420px",
+                    "padding": "40px 36px 36px",
+                    "borderRadius": "28px",
+                    "background": "rgba(255,255,255,.975)",
+                    "border": "1.5px solid rgba(255,255,255,.50)",
                     "boxShadow": (
-                        "0 28px 80px rgba(0,0,0,.35)"
+                        "0 40px 100px rgba(0,0,0,.45),"
+                        "0 0 0 1px rgba(255,255,255,.12),"
+                        "inset 0 1px 0 rgba(255,255,255,.8)"
                     ),
+                    "overflow": "hidden",
                 },
                 children=[
+                    # Orbe décoratif dans la carte
+                    html.Div(
+                        style={
+                            "position": "absolute",
+                            "width": "180px",
+                            "height": "180px",
+                            "borderRadius": "50%",
+                            "background": "radial-gradient(circle,rgba(37,99,235,.07),transparent 70%)",
+                            "top": "-60px",
+                            "right": "-60px",
+                            "pointerEvents": "none",
+                        }
+                    ),
+                    html.Div(
+                        style={
+                            "position": "absolute",
+                            "width": "120px",
+                            "height": "120px",
+                            "borderRadius": "50%",
+                            "background": "radial-gradient(circle,rgba(139,92,246,.06),transparent 70%)",
+                            "bottom": "-30px",
+                            "left": "-30px",
+                            "pointerEvents": "none",
+                        }
+                    ),
+                    # Logo
                     html.Div(
                         "◈",
                         style={
-                            "width": "58px",
-                            "height": "58px",
+                            "width": "62px",
+                            "height": "62px",
                             "display": "grid",
                             "placeItems": "center",
-                            "margin": "0 auto 18px",
-                            "borderRadius": "18px",
+                            "margin": "0 auto 20px",
+                            "borderRadius": "20px",
                             "fontSize": "28px",
                             "color": "white",
-                            "background": (
-                                "linear-gradient("
-                                "135deg,#60a5fa,#2563eb,#7c3aed)"
-                            ),
+                            "background": "linear-gradient(135deg,#60a5fa 0%,#3b82f6 40%,#7c3aed 100%)",
                             "boxShadow": (
-                                "0 15px 35px "
-                                "rgba(37,99,235,.35)"
+                                "0 18px 42px rgba(37,99,235,.40),"
+                                "inset 0 1px 0 rgba(255,255,255,.25)"
                             ),
+                            "position": "relative",
                         },
                     ),
-
                     html.H1(
                         "LogGuardian",
                         style={
-                            "margin": "0",
+                            "margin": "0 0 6px",
                             "textAlign": "center",
                             "fontSize": "28px",
                             "fontWeight": "900",
-                            "color": TXT,
+                            "letterSpacing": "-.045em",
+                            "background": f"linear-gradient(135deg,{TXT} 0%,#1e3a8a 100%)",
+                            "WebkitBackgroundClip": "text",
+                            "WebkitTextFillColor": "transparent",
+                            "backgroundClip": "text",
                         },
                     ),
-
                     html.P(
-                        "Connectez-vous à l’AIOps Command Center",
+                        "AIOps Command Center",
                         style={
                             "textAlign": "center",
                             "color": MUT,
-                            "fontSize": "13px",
-                            "marginBottom": "28px",
+                            "fontSize": "12px",
+                            "fontWeight": "600",
+                            "letterSpacing": ".08em",
+                            "textTransform": "uppercase",
+                            "marginBottom": "30px",
                         },
                     ),
-
                     html.Label(
-                        "Nom d’utilisateur",
+                        "Identifiant",
                         style={
                             "display": "block",
                             "fontSize": "11px",
                             "fontWeight": "800",
                             "color": MUT,
                             "marginBottom": "7px",
+                            "letterSpacing": ".04em",
                         },
                     ),
-
                     dcc.Input(
                         id="login-username",
                         type="text",
@@ -2385,16 +2664,20 @@ def _login_page() -> html.Div:
                         autoComplete="username",
                         style={
                             "width": "100%",
-                            "height": "46px",
-                            "padding": "0 14px",
-                            "borderRadius": "12px",
-                            "border": f"1px solid {BD}",
+                            "height": "48px",
+                            "padding": "0 16px",
+                            "borderRadius": "14px",
+                            "border": f"1.5px solid {BD}",
                             "fontSize": "13px",
+                            "fontWeight": "500",
+                            "color": TXT,
+                            "background": "rgba(248,250,255,.85)",
                             "outline": "none",
-                            "marginBottom": "17px",
+                            "marginBottom": "16px",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.04),inset 0 1px 0 rgba(255,255,255,.9)",
+                            "transition": "border-color .2s,box-shadow .2s",
                         },
                     ),
-
                     html.Label(
                         "Mot de passe",
                         style={
@@ -2403,50 +2686,53 @@ def _login_page() -> html.Div:
                             "fontWeight": "800",
                             "color": MUT,
                             "marginBottom": "7px",
+                            "letterSpacing": ".04em",
                         },
                     ),
-
                     dcc.Input(
                         id="login-password",
                         type="password",
-                        placeholder="Votre mot de passe",
+                        placeholder="••••••••",
                         autoComplete="current-password",
                         style={
                             "width": "100%",
-                            "height": "46px",
-                            "padding": "0 14px",
-                            "borderRadius": "12px",
-                            "border": f"1px solid {BD}",
-                            "fontSize": "13px",
+                            "height": "48px",
+                            "padding": "0 16px",
+                            "borderRadius": "14px",
+                            "border": f"1.5px solid {BD}",
+                            "fontSize": "14px",
+                            "fontWeight": "500",
+                            "color": TXT,
+                            "background": "rgba(248,250,255,.85)",
                             "outline": "none",
-                            "marginBottom": "20px",
+                            "marginBottom": "22px",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.04),inset 0 1px 0 rgba(255,255,255,.9)",
+                            "transition": "border-color .2s,box-shadow .2s",
                         },
                     ),
-
                     html.Button(
-                        "Se connecter",
+                        "Se connecter →",
                         id="login-button",
                         n_clicks=0,
                         style={
                             "width": "100%",
-                            "height": "48px",
+                            "height": "50px",
                             "border": "none",
-                            "borderRadius": "13px",
+                            "borderRadius": "15px",
                             "cursor": "pointer",
                             "color": "white",
-                            "fontSize": "13px",
+                            "fontSize": "14px",
                             "fontWeight": "900",
-                            "background": (
-                                "linear-gradient("
-                                "135deg,#7c3aed,#2563eb)"
-                            ),
+                            "letterSpacing": ".03em",
+                            "background": "linear-gradient(135deg,#6d28d9 0%,#2563eb 60%,#0ea5e9 100%)",
+                            "backgroundSize": "200% 200%",
                             "boxShadow": (
-                                "0 12px 26px "
-                                "rgba(37,99,235,.25)"
+                                "0 14px 32px rgba(37,99,235,.32),"
+                                "inset 0 1px 0 rgba(255,255,255,.20)"
                             ),
+                            "animation": "gradientShift 4s ease infinite",
                         },
                     ),
-
                     html.Div(
                         id="login-error",
                         style={
@@ -2459,7 +2745,7 @@ def _login_page() -> html.Div:
                         },
                     ),
                 ],
-            )
+            ),
         ],
     )
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2471,9 +2757,10 @@ def _authenticated_layout() -> html.Div:
             "height": "100vh",
             "display": "flex",
             "background": (
-                "radial-gradient(circle at 15% 10%,rgba(37,99,235,.08),transparent 28%),"
-                "radial-gradient(circle at 88% 8%,rgba(139,92,246,.08),transparent 30%),"
-                f"{BG}"
+                "radial-gradient(ellipse 70% 45% at 8% -8%,rgba(37,99,235,.13),transparent),"
+                "radial-gradient(ellipse 70% 45% at 92% -8%,rgba(139,92,246,.13),transparent),"
+                "radial-gradient(ellipse 50% 35% at 50% 108%,rgba(14,165,233,.07),transparent),"
+                f"linear-gradient(175deg,#eef3ff 0%,{BG} 100%)"
             ),
             "overflow": "hidden",
         },
@@ -2507,6 +2794,10 @@ def _authenticated_layout() -> html.Div:
             # Passe à True après un clic sur « Utile ».
             # Il est réinitialisé dès qu'un autre log est sélectionné.
             dcc.Store(id="feedback-accepted-store", data=False),
+
+            # Compte le nombre de réponses rejetées pour le log sélectionné.
+            # Il est remis à zéro dès qu'un autre log est sélectionné.
+            dcc.Store(id="negative-feedback-count-store", data=0),
         ],
 )
 app.layout = html.Div(
@@ -3615,6 +3906,7 @@ def apply_rag_visibility(
     Output("feedback-status", "children"),
     Output("rag-generated-store", "data"),
     Output("feedback-accepted-store", "data"),
+    Output("negative-feedback-count-store", "data"),
     Input("selected-log-store", "data"),
 )
 def render_selected_log(
@@ -3633,6 +3925,7 @@ def render_selected_log(
             "Aucune analyse lancée.",
             False,
             False,
+            0,
         )
 
     return (
@@ -3645,6 +3938,7 @@ def render_selected_log(
         "Log sélectionné — analyse non lancée.",
         False,
         False,
+        0,
     )
 
 
@@ -3658,18 +3952,20 @@ def render_selected_log(
     Input("selected-log-store", "data"),
     Input("rag-generated-store", "data"),
     Input("feedback-accepted-store", "data"),
+    Input("negative-feedback-count-store", "data"),
 )
 def update_feedback_buttons(
     row: dict[str, Any] | None,
     rag_generated: bool,
     feedback_accepted: bool,
+    negative_feedback_count: int | None,
 ) -> tuple[bool, dict[str, Any], str, bool, dict[str, Any], str]:
     """
-    Tant qu'aucune analyse n'existe, les deux boutons sont bloqués.
-    Après un clic sur « Utile », les deux boutons sont verrouillés pour
-    empêcher tout changement d'avis sur la même réponse.
+    Les boutons sont actifs seulement après une analyse.
+    Ils sont verrouillés après validation ou après 5 réponses rejetées.
     """
     feedback_available = bool(row) and bool(rag_generated)
+    rejected_count = int(negative_feedback_count or 0)
 
     if not feedback_available:
         return (
@@ -3699,13 +3995,26 @@ def update_feedback_buttons(
             "🔒 Pas utile",
         )
 
+    if rejected_count >= MAX_NEGATIVE_FEEDBACKS:
+        return (
+            True,
+            _feedback_button_style("positive", disabled=True),
+            "🔒 Limite atteinte",
+            True,
+            _feedback_button_style("negative", disabled=True),
+            "📧 Contacter le support",
+        )
+
     return (
         False,
         _feedback_button_style("positive"),
         "👍 Utile",
         False,
         _feedback_button_style("negative"),
-        "👎 Pas utile",
+        (
+            f"👎 Pas utile "
+            f"({rejected_count}/{MAX_NEGATIVE_FEEDBACKS})"
+        ),
     )
 
 
@@ -3770,6 +4079,11 @@ def generate_initial_rag(
     Output("rag-action", "children", allow_duplicate=True),
     Output("feedback-status", "children", allow_duplicate=True),
     Output("feedback-accepted-store", "data", allow_duplicate=True),
+    Output(
+        "negative-feedback-count-store",
+        "data",
+        allow_duplicate=True,
+    ),
     Input("fb-up", "n_clicks"),
     Input("fb-down", "n_clicks"),
     State("selected-log-store", "data"),
@@ -3777,6 +4091,7 @@ def generate_initial_rag(
     State("rag-action", "children"),
     State("rag-generated-store", "data"),
     State("feedback-accepted-store", "data"),
+    State("negative-feedback-count-store", "data"),
     prevent_initial_call=True,
 )
 def save_feedback(
@@ -3787,7 +4102,8 @@ def save_feedback(
     current_action: Any,
     rag_generated: bool,
     feedback_accepted: bool,
-) -> tuple[Any, Any, str, Any]:
+    negative_feedback_count: int | None,
+) -> tuple[Any, Any, str, Any, Any]:
     del up_clicks, down_clicks
 
     if not row:
@@ -3795,6 +4111,7 @@ def save_feedback(
             no_update,
             no_update,
             "Sélectionnez d'abord un log.",
+            no_update,
             no_update,
         )
 
@@ -3804,6 +4121,7 @@ def save_feedback(
             no_update,
             "Lancez d'abord l'analyse IA avant de donner un feedback.",
             no_update,
+            no_update,
         )
 
     if not callback_context.triggered:
@@ -3812,15 +4130,29 @@ def save_feedback(
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0]
     analysis_text = str(current_analysis or "").strip()
     action_text = str(current_action or "").strip()
+    rejected_count = int(negative_feedback_count or 0)
 
-    # Garde-fou côté serveur : même si un clic tardif arrive après la
-    # validation, aucun feedback négatif supplémentaire n'est accepté.
+    # Garde-fou côté serveur après validation.
     if feedback_accepted:
         return (
             no_update,
             no_update,
             "✅ Cette réponse a déjà été validée. Le feedback est verrouillé.",
             True,
+            no_update,
+        )
+
+    # Garde-fou côté serveur après atteinte de la limite.
+    if rejected_count >= MAX_NEGATIVE_FEEDBACKS:
+        return (
+            no_update,
+            no_update,
+            (
+                "🔒 La limite de réponses a été atteinte. "
+                f"Contactez {SUPPORT_EMAIL} pour une analyse manuelle."
+            ),
+            no_update,
+            MAX_NEGATIVE_FEEDBACKS,
         )
 
     if trigger == "fb-up":
@@ -3828,6 +4160,7 @@ def save_feedback(
             "feedback_timestamp": datetime.now().isoformat(timespec="seconds"),
             "feedback": "positive",
             "accepted": True,
+            "negative_feedback_count": rejected_count,
             "log_id": row.get("id"),
             "source": row.get("Source"),
             "host": row.get("Host"),
@@ -3839,7 +4172,10 @@ def save_feedback(
             "accepted_rag_analysis": analysis_text,
             "accepted_rag_recommendation": action_text,
             "generator": GROQ_MODEL,
-            "alert_threshold": row.get("_threshold_val", ALERT_THRESHOLD),
+            "alert_threshold": row.get(
+                "_threshold_val",
+                ALERT_THRESHOLD,
+            ),
         }
 
         try:
@@ -3849,6 +4185,7 @@ def save_feedback(
                 no_update,
                 "✅ Explication validée et acceptation enregistrée.",
                 True,
+                no_update,
             )
         except Exception as error:  # noqa: BLE001
             log.exception("Erreur sauvegarde feedback positif")
@@ -3857,14 +4194,23 @@ def save_feedback(
                 no_update,
                 f"⚠️ Validation non sauvegardée : {error}",
                 no_update,
+                no_update,
             )
 
     if trigger != "fb-down":
         raise PreventUpdate
 
+    # La réponse actuellement affichée vient d'être rejetée.
+    # Exemple :
+    # - réponse initiale rejetée -> tentative 1, génération de la réponse 2 ;
+    # - réponse 5 rejetée -> tentative 5, arrêt sans nouvel appel Groq.
+    next_rejected_count = rejected_count + 1
+
     record: dict[str, Any] = {
         "feedback_timestamp": datetime.now().isoformat(timespec="seconds"),
         "feedback": "negative",
+        "negative_feedback_count": next_rejected_count,
+        "max_negative_feedbacks": MAX_NEGATIVE_FEEDBACKS,
         "log_id": row.get("id"),
         "source": row.get("Source"),
         "host": row.get("Host"),
@@ -3878,8 +4224,52 @@ def save_feedback(
         "rag_version": "rag_v2_groq",
         "prompt_version": "initial_or_previous_response",
         "regeneration_prompt_version": "groq_regeneration_v2",
-        "alert_threshold": row.get("_threshold_val", ALERT_THRESHOLD),
+        "alert_threshold": row.get(
+            "_threshold_val",
+            ALERT_THRESHOLD,
+        ),
     }
+
+    # La 5e réponse vient d'être rejetée : on sauvegarde ce rejet,
+    # on n'effectue plus d'appel Groq et on oriente vers le support.
+    if next_rejected_count >= MAX_NEGATIVE_FEEDBACKS:
+        record.update(
+            {
+                "replacement_rag_analysis": None,
+                "replacement_rag_recommendation": None,
+                "replacement_generator": None,
+                "groq_success": False,
+                "groq_error": None,
+                "fallback_used": False,
+                "closed_after_max_feedbacks": True,
+                "support_email": SUPPORT_EMAIL,
+            }
+        )
+
+        try:
+            _save_feedback_record(record)
+        except Exception as error:  # noqa: BLE001
+            log.exception("Erreur sauvegarde du dernier feedback négatif")
+            return (
+                no_update,
+                no_update,
+                f"⚠️ Feedback non sauvegardé : {error}",
+                no_update,
+                rejected_count,
+            )
+
+        return (
+            no_update,
+            no_update,
+            (
+                f"🔒 Après {MAX_NEGATIVE_FEEDBACKS} réponses, "
+                "aucune proposition n'a été jugée utile. "
+                f"Contactez la personne en charge à {SUPPORT_EMAIL} "
+                "en lui transmettant le message du log, le score et le ratio."
+            ),
+            False,
+            next_rejected_count,
+        )
 
     replacement: dict[str, str] | None = None
     generation_notice: str | None = None
@@ -3898,6 +4288,7 @@ def save_feedback(
                 "groq_success": True,
                 "groq_error": None,
                 "fallback_used": False,
+                "closed_after_max_feedbacks": False,
             }
         )
 
@@ -3926,6 +4317,7 @@ def save_feedback(
                     "groq_error": str(error),
                     "fallback_used": True,
                     "rate_limit_wait": wait_text,
+                    "closed_after_max_feedbacks": False,
                 }
             )
         else:
@@ -3937,6 +4329,7 @@ def save_feedback(
                     "groq_success": False,
                     "groq_error": str(error),
                     "fallback_used": False,
+                    "closed_after_max_feedbacks": False,
                 }
             )
 
@@ -3949,6 +4342,7 @@ def save_feedback(
             no_update,
             f"⚠️ Feedback non sauvegardé : {error}",
             no_update,
+            rejected_count,
         )
 
     if replacement is None:
@@ -3960,19 +4354,15 @@ def save_feedback(
                 f"pu être générée : {record['groq_error']}"
             ),
             no_update,
+            next_rejected_count,
         )
 
     return (
         replacement["analysis"],
         replacement["action"],
-        (
-            generation_notice
-            or (
-                "🔄 Nouvelle réponse générée. Vous pouvez cliquer encore sur "
-                "« Pas utile » si nécessaire."
-            )
-        ),
+        generation_notice or "🔄 Nouvelle réponse générée.",
         False,
+        next_rejected_count,
     )
 
 
