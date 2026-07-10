@@ -35,7 +35,7 @@ except ImportError:
     pass
 
 import dash
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, Producer
 from dash import callback_context, dash_table, dcc, html, no_update
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
@@ -116,11 +116,33 @@ SUPPORT_EMAIL = os.getenv(
     "admin@log-guardian.fr",
 ).strip()
 
+KAFKA_SUPPORT_TOPIC = os.getenv("KAFKA_SUPPORT_TOPIC", "support-tickets")
+
 _buffer: deque[dict[str, Any]] = deque(maxlen=MAX_ROWS)
 _lock = threading.Lock()
 _total_received = 0
 _total_alerts_received = 0
 _seen_event_ids: set[str] = set()
+
+_ticket_producer: Producer | None = None
+_ticket_producer_lock = threading.Lock()
+
+
+def _get_ticket_producer() -> Producer:
+    global _ticket_producer
+    with _ticket_producer_lock:
+        if _ticket_producer is None:
+            _ticket_producer = Producer(
+                {"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS}
+            )
+    return _ticket_producer
+
+
+def _publish_support_ticket(ticket: dict[str, Any]) -> None:
+    producer = _get_ticket_producer()
+    payload = json.dumps(ticket, ensure_ascii=False, default=str)
+    producer.produce(KAFKA_SUPPORT_TOPIC, value=payload.encode("utf-8"))
+    producer.flush(timeout=5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,7 +237,8 @@ def _build_row(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("threshold", ALERT_THRESHOLD),
         ALERT_THRESHOLD,
     )
-    status = "ANOMALIE" if ratio > threshold else "NORMAL"
+    status = "ANOMALIE" if score > threshold else "NORMAL"
+    # status = "ANOMALIE" if ratio > threshold else "NORMAL"
 
     return {
         "id": _stable_event_id(payload),
@@ -2134,6 +2157,244 @@ def _rag_side_panel() -> html.Div:
 
 
 
+def _ticket_modal() -> html.Div:
+    _sec = {
+        "fontSize": "9px",
+        "fontWeight": "900",
+        "color": MUT,
+        "textTransform": "uppercase",
+        "letterSpacing": ".12em",
+        "fontFamily": "JetBrains Mono, monospace",
+        "marginBottom": "8px",
+    }
+    _ro_box = {
+        "background": "#f8faff",
+        "border": f"1px solid {BD}",
+        "borderRadius": "12px",
+        "padding": "11px 13px",
+        "fontSize": "12px",
+        "color": TXT,
+        "lineHeight": "1.65",
+        "maxHeight": "90px",
+        "overflowY": "auto",
+        "whiteSpace": "pre-wrap",
+        "wordBreak": "break-word",
+    }
+    return html.Div(
+        id="ticket-modal-overlay",
+        style={
+            "display": "none",
+            "position": "fixed",
+            "top": "0",
+            "left": "0",
+            "right": "0",
+            "bottom": "0",
+            "zIndex": "9999",
+            "alignItems": "center",
+            "justifyContent": "center",
+            "background": "rgba(5,10,25,.78)",
+            "backdropFilter": "blur(12px)",
+            "WebkitBackdropFilter": "blur(12px)",
+        },
+        children=[
+            html.Div(
+                style={
+                    "width": "100%",
+                    "maxWidth": "600px",
+                    "maxHeight": "90vh",
+                    "overflowY": "auto",
+                    "margin": "0 20px",
+                    "background": "rgba(255,255,255,.99)",
+                    "border": f"1.5px solid {BD}",
+                    "borderRadius": "24px",
+                    "boxShadow": (
+                        "0 48px 100px rgba(0,0,0,.55),"
+                        "inset 0 1px 0 rgba(255,255,255,.9)"
+                    ),
+                    "padding": "28px 28px 24px",
+                    "position": "relative",
+                },
+                children=[
+                    # ── Header ──────────────────────────────────────
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "justifyContent": "space-between",
+                            "alignItems": "flex-start",
+                            "marginBottom": "18px",
+                        },
+                        children=[
+                            html.Div([
+                                html.Div(
+                                    "🎫 Ticket de support",
+                                    style={
+                                        "fontSize": "18px",
+                                        "fontWeight": "900",
+                                        "color": TXT,
+                                        "letterSpacing": "-.025em",
+                                    },
+                                ),
+                                html.Div(
+                                    "5 analyses rejetées — demande de vérification manuelle",
+                                    style={
+                                        "fontSize": "11px",
+                                        "color": MUT,
+                                        "marginTop": "5px",
+                                        "fontWeight": "500",
+                                    },
+                                ),
+                            ]),
+                            html.Button(
+                                "×",
+                                id="ticket-close-btn",
+                                n_clicks=0,
+                                style={
+                                    "width": "32px",
+                                    "height": "32px",
+                                    "borderRadius": "10px",
+                                    "border": f"1px solid {BD}",
+                                    "background": PAPER,
+                                    "color": MUT,
+                                    "fontSize": "20px",
+                                    "lineHeight": "1",
+                                    "cursor": "pointer",
+                                    "display": "grid",
+                                    "placeItems": "center",
+                                    "flexShrink": "0",
+                                },
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        style={
+                            "height": "1px",
+                            "background": BD2,
+                            "marginBottom": "20px",
+                        }
+                    ),
+                    # ── Log info ─────────────────────────────────────
+                    html.Div("Log concerné", style=_sec),
+                    html.Div(
+                        id="ticket-log-info",
+                        style={
+                            "display": "grid",
+                            "gridTemplateColumns": "repeat(3, 1fr)",
+                            "gap": "8px",
+                            "marginBottom": "16px",
+                        },
+                    ),
+                    # ── Last analysis ────────────────────────────────
+                    html.Div("Dernière analyse rejetée", style=_sec),
+                    html.Div(
+                        id="ticket-last-analysis",
+                        style={
+                            **_ro_box,
+                            "borderLeft": f"3px solid {PURP}",
+                            "marginBottom": "12px",
+                        },
+                    ),
+                    # ── Last action ──────────────────────────────────
+                    html.Div("Dernière recommandation rejetée", style=_sec),
+                    html.Div(
+                        id="ticket-last-action",
+                        style={
+                            **_ro_box,
+                            "borderLeft": f"3px solid {GREEN}",
+                            "marginBottom": "16px",
+                        },
+                    ),
+                    # ── User message ─────────────────────────────────
+                    html.Div("Votre commentaire (optionnel)", style=_sec),
+                    dcc.Textarea(
+                        id="ticket-user-message",
+                        placeholder=(
+                            "Décrivez le comportement attendu, "
+                            "le contexte ou toute information utile à l'équipe support…"
+                        ),
+                        style={
+                            "width": "100%",
+                            "height": "88px",
+                            "borderRadius": "12px",
+                            "border": f"1.5px solid {BD}",
+                            "padding": "10px 13px",
+                            "fontSize": "12px",
+                            "color": TXT,
+                            "background": "rgba(248,250,255,.85)",
+                            "outline": "none",
+                            "resize": "vertical",
+                            "fontFamily": "inherit",
+                            "lineHeight": "1.6",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.035)",
+                        },
+                    ),
+                    # ── Status ───────────────────────────────────────
+                    html.Div(
+                        id="ticket-send-status",
+                        style={
+                            "fontSize": "11px",
+                            "fontWeight": "600",
+                            "color": MUT,
+                            "marginTop": "10px",
+                            "minHeight": "18px",
+                        },
+                    ),
+                    # ── Footer buttons ───────────────────────────────
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "justifyContent": "flex-end",
+                            "gap": "10px",
+                            "marginTop": "20px",
+                            "paddingTop": "16px",
+                            "borderTop": f"1px solid {BD2}",
+                        },
+                        children=[
+                            html.Button(
+                                "Annuler",
+                                id="ticket-cancel-btn",
+                                n_clicks=0,
+                                style={
+                                    "height": "42px",
+                                    "padding": "0 22px",
+                                    "borderRadius": "12px",
+                                    "border": f"1px solid {BD}",
+                                    "background": PAPER,
+                                    "color": MUT,
+                                    "fontSize": "12px",
+                                    "fontWeight": "700",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                            html.Button(
+                                "📨 Envoyer le ticket",
+                                id="ticket-send-btn",
+                                n_clicks=0,
+                                style={
+                                    "height": "42px",
+                                    "padding": "0 22px",
+                                    "borderRadius": "12px",
+                                    "border": "none",
+                                    "background": (
+                                        f"linear-gradient(135deg,{PURP},{BLUE})"
+                                    ),
+                                    "color": "white",
+                                    "fontSize": "12px",
+                                    "fontWeight": "900",
+                                    "cursor": "pointer",
+                                    "boxShadow": (
+                                        "0 8px 22px rgba(139,92,246,.32)"
+                                    ),
+                                    "letterSpacing": ".01em",
+                                },
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+
 def _logs_workspace_style(opened: bool) -> dict[str, Any]:
     return {
         "height": "calc(100% - 76px)",
@@ -2798,6 +3059,10 @@ def _authenticated_layout() -> html.Div:
             # Compte le nombre de réponses rejetées pour le log sélectionné.
             # Il est remis à zéro dès qu'un autre log est sélectionné.
             dcc.Store(id="negative-feedback-count-store", data=0),
+
+            dcc.Store(id="ticket-prefill-store", data=None),
+
+            _ticket_modal(),
         ],
 )
 app.layout = html.Div(
@@ -4424,6 +4689,178 @@ def update_alerts(_: int) -> tuple[list[dict[str, Any]], html.Div]:
         [_display_row(row, include_model=True) for row in critical],
         strip,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — TICKET DE SUPPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MODAL_HIDDEN: dict[str, Any] = {
+    "display": "none",
+    "position": "fixed",
+    "top": "0",
+    "left": "0",
+    "right": "0",
+    "bottom": "0",
+    "zIndex": "9999",
+    "alignItems": "center",
+    "justifyContent": "center",
+    "background": "rgba(5,10,25,.78)",
+    "backdropFilter": "blur(12px)",
+    "WebkitBackdropFilter": "blur(12px)",
+}
+_MODAL_VISIBLE: dict[str, Any] = {**_MODAL_HIDDEN, "display": "flex"}
+
+
+def _ticket_pill(label: str, value: str, accent: str) -> html.Div:
+    return html.Div(
+        style={
+            "background": f"{accent}0d",
+            "border": f"1px solid {accent}30",
+            "borderRadius": "12px",
+            "padding": "10px 12px",
+        },
+        children=[
+            html.Div(
+                label,
+                style={
+                    "fontSize": "8px",
+                    "fontWeight": "900",
+                    "color": accent,
+                    "textTransform": "uppercase",
+                    "letterSpacing": ".12em",
+                    "fontFamily": "JetBrains Mono, monospace",
+                    "marginBottom": "4px",
+                },
+            ),
+            html.Div(
+                value or "—",
+                style={
+                    "fontSize": "12px",
+                    "fontWeight": "700",
+                    "color": TXT,
+                    "overflow": "hidden",
+                    "textOverflow": "ellipsis",
+                    "whiteSpace": "nowrap",
+                },
+            ),
+        ],
+    )
+
+
+@app.callback(
+    Output("ticket-modal-overlay", "style"),
+    Output("ticket-prefill-store", "data"),
+    Output("ticket-log-info", "children"),
+    Output("ticket-last-analysis", "children"),
+    Output("ticket-last-action", "children"),
+    Output("ticket-user-message", "value"),
+    Output("ticket-send-status", "children"),
+    Input("negative-feedback-count-store", "data"),
+    Input("ticket-close-btn", "n_clicks"),
+    Input("ticket-cancel-btn", "n_clicks"),
+    Input("ticket-send-btn", "n_clicks"),
+    State("selected-log-store", "data"),
+    State("rag-analysis", "children"),
+    State("rag-action", "children"),
+    State("ticket-prefill-store", "data"),
+    State("ticket-user-message", "value"),
+    prevent_initial_call=True,
+)
+def manage_ticket_modal(
+    count: int | None,
+    _close: int,
+    _cancel: int,
+    _send: int,
+    row: dict[str, Any] | None,
+    analysis: Any,
+    action: Any,
+    prefill: dict[str, Any] | None,
+    user_message: str | None,
+) -> tuple[Any, ...]:
+    del _close, _cancel, _send
+
+    if not callback_context.triggered:
+        raise PreventUpdate
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0]
+
+    # ── Fermer le popup ────────────────────────────────────────────────────
+    if trigger in {"ticket-close-btn", "ticket-cancel-btn"}:
+        return (
+            _MODAL_HIDDEN, no_update, no_update, no_update,
+            no_update, no_update, "",
+        )
+
+    # ── Envoyer le ticket ──────────────────────────────────────────────────
+    if trigger == "ticket-send-btn":
+        if not prefill:
+            return (
+                no_update, no_update, no_update, no_update,
+                no_update, no_update, "⚠️ Aucun log sélectionné.",
+            )
+        ticket = {
+            "ticket_type": "support_ticket",
+            "submitted_at": datetime.now().isoformat(timespec="seconds"),
+            **prefill,
+            "user_message": (user_message or "").strip(),
+            "negative_feedback_count": MAX_NEGATIVE_FEEDBACKS,
+        }
+        try:
+            _publish_support_ticket(ticket)
+            log.info(
+                "Ticket support publié | log_id=%s | source=%s",
+                ticket.get("log_id"),
+                ticket.get("source"),
+            )
+            return (
+                _MODAL_HIDDEN, no_update, no_update, no_update,
+                no_update, no_update, "",
+            )
+        except Exception as err:  # noqa: BLE001
+            log.exception("Erreur publication ticket Kafka")
+            return (
+                no_update, no_update, no_update, no_update,
+                no_update, no_update, f"⚠️ Envoi échoué : {err}",
+            )
+
+    # ── Ouvrir le popup après 5 rejets ─────────────────────────────────────
+    if trigger == "negative-feedback-count-store":
+        if int(count or 0) >= MAX_NEGATIVE_FEEDBACKS and row:
+            new_prefill: dict[str, Any] = {
+                "log_id": row.get("id", ""),
+                "source": row.get("Source", ""),
+                "host": row.get("Host", ""),
+                "message": row.get("Message", ""),
+                "score_ia": row.get("Score IA", ""),
+                "ratio": row.get("Ratio", ""),
+                "statut": row.get("Statut", ""),
+                "model_version": row.get("Model", ""),
+                "timestamp": row.get("Timestamp", ""),
+                "last_analysis": str(analysis or ""),
+                "last_action": str(action or ""),
+            }
+            is_anomaly = new_prefill["statut"] == "ANOMALIE"
+            statut_accent = RED if is_anomaly else GREEN
+            log_info = [
+                _ticket_pill("Source", new_prefill["source"], BLUE),
+                _ticket_pill("Host", new_prefill["host"], CYAN),
+                _ticket_pill("Statut", new_prefill["statut"], statut_accent),
+                _ticket_pill("Score IA", new_prefill["score_ia"], PURP),
+                _ticket_pill("Ratio", new_prefill["ratio"], ORAN),
+                _ticket_pill("Date", new_prefill["timestamp"], MUT),
+            ]
+            return (
+                _MODAL_VISIBLE,
+                new_prefill,
+                log_info,
+                new_prefill["last_analysis"] or "—",
+                new_prefill["last_action"] or "—",
+                "",
+                "",
+            )
+
+    raise PreventUpdate
 
 
 if __name__ == "__main__":
