@@ -3,6 +3,9 @@
 *.pkl
 *.npy
 
+# Fichiers ML téléchargés temporairement depuis GCS pour édition locale
+/threshold.json
+
 # Fichiers système Mac
 .DS_Store
 
