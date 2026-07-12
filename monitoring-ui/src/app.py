@@ -194,7 +194,7 @@ def _build_row(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("threshold", ALERT_THRESHOLD),
         ALERT_THRESHOLD,
     )
-    status = "ANOMALIE" if ratio > threshold else "NORMAL"
+    status = "ANOMALIE" if ratio > ALERT_THRESHOLD else "NORMAL"
 
     return {
         "id": _stable_event_id(payload),
