@@ -64,6 +64,29 @@ def load_k8s_config():
         log.info("Kubernetes kubeconfig local chargé (dev)")
 
 
+_pod_cache: dict[str, float] = {}
+_pod_cache_ts: float = 0.0
+_POD_CACHE_TTL = 15.0
+
+
+def list_pods_cached(api: client.CoreV1Api, namespace: str) -> set[str]:
+    """Liste les pods réels du namespace, avec cache TTL 15s."""
+    global _pod_cache, _pod_cache_ts
+    now = time.time()
+    if now - _pod_cache_ts < _POD_CACHE_TTL and _pod_cache:
+        return set(_pod_cache.keys())
+
+    try:
+        pods = api.list_namespaced_pod(namespace=namespace, timeout_seconds=5)
+        names = {p.metadata.name for p in pods.items}
+        _pod_cache = {n: now for n in names}
+        _pod_cache_ts = now
+        return names
+    except ApiException as e:
+        log.error("Erreur list_namespaced_pod: %s", e.reason)
+        return set()
+
+
 def restart_pod(api: client.CoreV1Api, pod: str, namespace: str) -> bool:
     """
     Supprime le pod → le Deployment le recrée automatiquement.
@@ -121,6 +144,7 @@ def main():
     stats = {
         "seen": 0, "warn": 0, "critical": 0,
         "restarted": 0, "skipped_cooldown": 0, "skipped_protected": 0,
+        "skipped_not_in_ns": 0,
     }
     last_stat_log = time.time()
 
@@ -169,10 +193,18 @@ def main():
             log.info("  ⊘ Cooldown actif (%ds restants)", int(COOLDOWN_SECONDS - since))
             continue
 
+        # Ne tenter la rémédiation que si le host correspond à un vrai pod du namespace
+        real_pods = list_pods_cached(api, NAMESPACE_TO_WATCH)
+        if host not in real_pods:
+            stats["skipped_not_in_ns"] += 1
+            log.info("  ⊘ Host '%s' n'est pas un pod du namespace '%s' (ignoré)", host, NAMESPACE_TO_WATCH)
+            last_action[host] = now  # cooldown pour éviter le spam
+            continue
+
         log.info("  → REMEDIATION : delete pod %s in namespace %s", host, NAMESPACE_TO_WATCH)
+        last_action[host] = now  # cooldown activé même si delete échoue
         if restart_pod(api, host, NAMESPACE_TO_WATCH):
             stats["restarted"] += 1
-            last_action[host] = now
 
 
 if __name__ == "__main__":
