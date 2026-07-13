@@ -106,6 +106,11 @@ LOGIN_PASSWORD = os.getenv(
     "admin",
 ).strip()
 
+# Mode d'authentification :
+#   - "local" (défaut) : login Flask (Docker Compose local)
+#   - "iap"           : skip login Flask, IAP fait déjà l'auth (GKE prod)
+AUTH_MODE = os.getenv("AUTH_MODE", "local").strip().lower()
+
 # Nombre maximal de réponses pouvant être rejetées pour un même log.
 # La 5e réponse rejetée clôt la boucle et oriente l'utilisateur vers le support.
 MAX_NEGATIVE_FEEDBACKS = int(
@@ -3088,7 +3093,7 @@ def display_authenticated_content(
 ) -> html.Div:
     del pathname
 
-    if session.get("authenticated"):
+    if AUTH_MODE == "iap" or session.get("authenticated"):
         return _authenticated_layout()
 
     return _login_page()

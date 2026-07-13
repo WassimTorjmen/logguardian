@@ -8,6 +8,7 @@ data:
   KAFKA_TOPIC: logs-anomalies-ml
   MAX_ROWS: "2000"
   REFRESH_INTERVAL_MS: "3000"
+  AUTH_MODE: "iap"
 ---
 apiVersion: apps/v1
 kind: Deployment
