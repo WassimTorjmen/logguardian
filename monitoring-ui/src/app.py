@@ -1,1250 +1,4871 @@
 """
-LogGuardian — AIOps Platform UI  (multi-pages : Dashboard / Logs / Alertes)
+LogGuardian — AIOps Command Center
+
+Fonctionnalités :
+- consommation Kafka temps réel ;
+- cockpit de supervision ;
+- tableau des logs avec filtres stables ;
+- sélection stable d'un log grâce à son identifiant ;
+- panneau Analyste IA affiché uniquement à la demande ;
+- première analyse Groq contextualisée ;
+- régénération Groq après un feedback négatif ;
+- sauvegarde des feedbacks positifs et négatifs en JSONL ;
+- incident board avec compteur cumulé des alertes.
 """
-import json, logging, os, threading, random
-from collections import deque
-from datetime import datetime, timedelta
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+from collections import Counter, deque
+from difflib import SequenceMatcher
+from datetime import datetime
+from typing import Any
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    # Docker Compose peut injecter les variables sans python-dotenv.
+    pass
 
 import dash
-from dash import dash_table, dcc, html, callback_context
+from confluent_kafka import Consumer, Producer
+from dash import callback_context, dash_table, dcc, html, no_update
 from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
+from groq import Groq
 import plotly.graph_objects as go
-from confluent_kafka import Consumer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("monitoring-ui")
+from flask import session
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC             = os.getenv("KAFKA_TOPIC", "logs-anomalies-ml")
-MAX_ROWS                = int(os.getenv("MAX_ROWS", "2000"))
-REFRESH_INTERVAL_MS     = int(os.getenv("REFRESH_INTERVAL_MS", "3000"))
 
-_buffer: deque = deque(maxlen=MAX_ROWS)
-_seen: set = set()
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
+log = logging.getLogger("logguardian-ui")
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "localhost:9092",
+)
+KAFKA_TOPIC = os.getenv(
+    "KAFKA_TOPIC",
+    "logs-anomalies-ml",
+)
+MAX_ROWS = int(os.getenv("MAX_ROWS", "2000"))
+REFRESH_INTERVAL_MS = int(os.getenv("REFRESH_INTERVAL_MS", "3000"))
+KAFKA_GROUP_ID = os.getenv(
+    "KAFKA_GROUP_ID",
+    f"monitoring-ui-{os.getpid()}-{int(datetime.now().timestamp())}",
+)
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "1.3"))
+FEEDBACK_PATH = os.getenv(
+    "FEEDBACK_PATH",
+    "/app/feedback/rag_feedback.jsonl",
+)
+
+# La variable est toujours définie, même si la clé est absente.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b",
+).strip()
+
+# Limite volontairement basse : l'interface demande seulement quelques phrases.
+# Cela réduit fortement la consommation quotidienne de tokens.
+GROQ_MAX_COMPLETION_TOKENS = int(
+    os.getenv("GROQ_MAX_COMPLETION_TOKENS", "550")
+)
+GROQ_RETRY_COMPLETION_TOKENS = int(
+    os.getenv("GROQ_RETRY_COMPLETION_TOKENS", "850")
+)
+
+# Facultatif : un autre modèle Groq peut être utilisé si le modèle principal
+# a atteint sa limite. Laisser vide pour utiliser directement le fallback local.
+GROQ_FALLBACK_MODEL = os.getenv(
+    "GROQ_FALLBACK_MODEL",
+    "",
+).strip()
+LOGIN_USERNAME = os.getenv(
+    "LOGIN_USERNAME",
+    "admin",
+).strip()
+
+LOGIN_PASSWORD = os.getenv(
+    "LOGIN_PASSWORD",
+    "admin",
+).strip()
+
+# Nombre maximal de réponses pouvant être rejetées pour un même log.
+# La 5e réponse rejetée clôt la boucle et oriente l'utilisateur vers le support.
+MAX_NEGATIVE_FEEDBACKS = int(
+    os.getenv("MAX_NEGATIVE_FEEDBACKS", "5")
+)
+SUPPORT_EMAIL = os.getenv(
+    "SUPPORT_EMAIL",
+    "admin@log-guardian.fr",
+).strip()
+
+KAFKA_SUPPORT_TOPIC = os.getenv("KAFKA_SUPPORT_TOPIC", "support-tickets")
+
+_buffer: deque[dict[str, Any]] = deque(maxlen=MAX_ROWS)
 _lock = threading.Lock()
 _total_received = 0
+_total_alerts_received = 0
+_seen_event_ids: set[str] = set()
+
+_ticket_producer: Producer | None = None
+_ticket_producer_lock = threading.Lock()
 
 
-def _kafka_thread():
-    log.info("Thread Kafka démarré — connexion à %s", KAFKA_BOOTSTRAP_SERVERS)
-    consumer = Consumer({
-        "bootstrap.servers":  KAFKA_BOOTSTRAP_SERVERS,
-        "group.id":           "monitoring-ui",
-        "auto.offset.reset":  "latest",
-        "enable.auto.commit": True,
-    })
-    consumer.subscribe([KAFKA_TOPIC])
-    while True:
-        msg = consumer.poll(timeout=1.0)
-        if msg is None:
-            continue
-        if msg.error():
-            log.warning("Erreur Kafka : %s", msg.error())
-            continue
-        try:
-            global _total_received
-            r = json.loads(msg.value().decode("utf-8"))
-            dedup_key = (
-                r.get("detected_at", "")[:19],
-                r.get("source", ""),
-                r.get("host", ""),
-                f"{r.get('anomaly_score', 0):.4f}",
+def _get_ticket_producer() -> Producer:
+    global _ticket_producer
+    with _ticket_producer_lock:
+        if _ticket_producer is None:
+            _ticket_producer = Producer(
+                {"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS}
             )
+    return _ticket_producer
+
+
+def _publish_support_ticket(ticket: dict[str, Any]) -> None:
+    producer = _get_ticket_producer()
+    payload = json.dumps(ticket, ensure_ascii=False, default=str)
+    producer.produce(KAFKA_SUPPORT_TOPIC, value=payload.encode("utf-8"))
+    producer.flush(timeout=5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THÈME
+# ─────────────────────────────────────────────────────────────────────────────
+BG = "#eef3fb"
+PAPER = "#ffffff"
+SIDE = "#071225"
+SIDE2 = "#0c1b36"
+BD = "#dbe5f1"
+BD2 = "#edf2f8"
+TXT = "#0f172a"
+MUT = "#64748b"
+MUT2 = "#94a3b8"
+BLUE = "#2563eb"
+CYAN = "#0ea5e9"
+GREEN = "#10b981"
+RED = "#ef4444"
+ORAN = "#f97316"
+PURP = "#8b5cf6"
+YELL = "#f59e0b"
+
+TABLE_COLS = [
+    "Timestamp",
+    "Source",
+    "Host",
+    "Message",
+    "Score IA",
+    "Ratio",
+    "Statut",
+]
+ALERT_COLS = [
+    "Timestamp",
+    "Source",
+    "Host",
+    "Message",
+    "Score IA",
+    "Ratio",
+    "Model",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTILS KAFKA / DONNÉES
+# ─────────────────────────────────────────────────────────────────────────────
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_message(payload: dict[str, Any]) -> str:
+    sequence = payload.get("sequence") or []
+
+    if isinstance(sequence, list) and sequence:
+        last = sequence[-1]
+
+        if isinstance(last, dict):
+            return str(last.get("message", ""))[:300]
+
+        return str(last)[:300]
+
+    return str(payload.get("message", ""))[:300]
+
+
+def _stable_event_id(payload: dict[str, Any]) -> str:
+    """Identifiant stable pendant les rafraîchissements de la table."""
+    try:
+        serialized = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+    except TypeError:
+        serialized = str(payload)
+
+    digest = hashlib.sha1(
+        serialized.encode("utf-8", errors="ignore")
+    ).hexdigest()[:14]
+
+    detected = str(payload.get("detected_at", "unknown"))
+    return f"{detected}_{digest}"
+
+
+def _build_row(payload: dict[str, Any]) -> dict[str, Any]:
+    detected = str(payload.get("detected_at", ""))
+    score = _safe_float(payload.get("anomaly_score", 0.0))
+    ratio = _safe_float(payload.get("severity_ratio", 0.0))
+    threshold = _safe_float(
+        payload.get("threshold", ALERT_THRESHOLD),
+        ALERT_THRESHOLD,
+    )
+    status = "ANOMALIE" if score > threshold else "NORMAL"
+    # status = "ANOMALIE" if ratio > threshold else "NORMAL"
+
+    return {
+        "id": _stable_event_id(payload),
+        "Timestamp": detected[:19].replace("T", " "),
+        "Source": str(payload.get("source", "unknown")),
+        "Host": str(payload.get("host", "unknown")),
+        "Message": _extract_message(payload),
+        "Score IA": f"{score:.2f}",
+        "Ratio": f"{ratio:.2f}x",
+        "Model": str(payload.get("model_version", "unknown")),
+        "Statut": status,
+        "_score_val": score,
+        "_ratio_val": ratio,
+        "_threshold_val": threshold,
+        "_raw": payload,
+    }
+
+
+def _kafka_thread() -> None:
+    global _total_received, _total_alerts_received
+
+    log.info(
+        "Kafka consumer start — broker=%s topic=%s",
+        KAFKA_BOOTSTRAP_SERVERS,
+        KAFKA_TOPIC,
+    )
+
+    consumer = Consumer(
+        {
+            "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
+            "group.id": KAFKA_GROUP_ID,
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": True,
+        }
+    )
+    consumer.subscribe([KAFKA_TOPIC])
+
+    while True:
+        message = consumer.poll(timeout=1.0)
+
+        if message is None:
+            continue
+
+        if message.error():
+            log.warning("Kafka error: %s", message.error())
+            continue
+
+        try:
+            payload = json.loads(message.value().decode("utf-8"))
+            row = _build_row(payload)
+
             with _lock:
-                if dedup_key in _seen:
-                    log.debug("Message dupliqué ignoré : %s", dedup_key)
+                # Évite d'ajouter plusieurs fois exactement le même événement
+                # lorsque Kafka rejoue une partie du topic.
+                if row["id"] in _seen_event_ids:
                     continue
-                row = {
-                    "Timestamp":  r.get("detected_at", "")[:19].replace("T", " "),
-                    "Source":     r.get("source", ""),
-                    "Host":       r.get("host", ""),
-                    "Message":    r.get("sequence", [{}])[-1].get("message", "")[:120],
-                    "Score IA":   f"{r.get('anomaly_score', 0):.2f}",
-                    "Ratio":      f"{r.get('severity_ratio', 0):.2f}x",
-                    "Statut":     "ANOMALIE" if r.get("severity_ratio", 0) > 1.3 else "NORMAL",
-                    "_ratio_val": r.get("severity_ratio", 0),
-                    "_score_val": r.get("anomaly_score", 0),
-                    "_ts":        r.get("detected_at", ""),
-                }
-                _seen.add(dedup_key)
-                if len(_seen) > MAX_ROWS * 2:
-                    for _ in range(MAX_ROWS):
-                        _seen.pop()
+
+                _seen_event_ids.add(row["id"])
                 _buffer.appendleft(row)
                 _total_received += 1
-        except Exception as e:
-            log.error("Erreur parsing message : %s", e)
+
+                if row["Statut"] == "ANOMALIE":
+                    _total_alerts_received += 1
+
+        except Exception as error:  # noqa: BLE001
+            log.exception("Message parsing error: %s", error)
 
 
-threading.Thread(target=_kafka_thread, daemon=True).start()
+threading.Thread(
+    target=_kafka_thread,
+    daemon=True,
+).start()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLICATION DASH
 # ─────────────────────────────────────────────────────────────────────────────
 app = dash.Dash(
     __name__,
-    title="LogGuardian — AIOps Platform",
+    title="LogGuardian — Command Center",
     suppress_callback_exceptions=True,
 )
-app.server.config["SECRET_KEY"] = "logguardian"
+app.server.config["SECRET_KEY"] = os.getenv(
+    "DASH_SECRET_KEY",
+    "logguardian-command-center",
+)
 
-app.index_string = '''<!DOCTYPE html>
+app.index_string = f"""<!DOCTYPE html>
 <html>
-<head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}
+<head>
+{{%metas%}}
+<title>{{%title%}}</title>
+{{%favicon%}}
+{{%css%}}
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; background: #0b0d14; overflow: hidden; }
-  ::-webkit-scrollbar { width: 4px; height: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #2a2f45; border-radius: 2px; }
+:root {{
+  --bg:{BG};--paper:{PAPER};--border:{BD};--border-soft:{BD2};
+  --text:{TXT};--muted:{MUT};--muted2:#94a3b8;
+  --blue:{BLUE};--cyan:{CYAN};--green:{GREEN};--red:{RED};--orange:{ORAN};--purple:{PURP};
+  --shadow-xs:0 1px 4px rgba(15,23,42,.06);
+  --shadow-sm:0 4px 14px rgba(15,23,42,.07);
+  --shadow-md:0 10px 32px rgba(15,23,42,.10);
+  --shadow-lg:0 22px 60px rgba(15,23,42,.13);
+  --shadow-xl:0 36px 90px rgba(15,23,42,.18);
+  --r-sm:10px;--r-md:14px;--r-lg:20px;--r-xl:28px;
+  --ease-out:cubic-bezier(.2,.8,.2,1);
+}}
+*,*::before,*::after{{box-sizing:border-box}}
+html,body{{
+  height:100%;margin:0;overflow:hidden;color:var(--text);
+  font-family:"Inter",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:
+    radial-gradient(ellipse 70% 45% at 8% -8%,rgba(37,99,235,.16),transparent),
+    radial-gradient(ellipse 70% 45% at 92% -8%,rgba(139,92,246,.16),transparent),
+    radial-gradient(ellipse 55% 35% at 50% 108%,rgba(14,165,233,.09),transparent),
+    linear-gradient(175deg,#eef3ff 0%,{BG} 100%);
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+  text-rendering:optimizeLegibility;
+}}
+button,input{{font-family:inherit}}
+button{{
+  transition:transform .18s var(--ease-out),box-shadow .18s ease,
+    background .15s ease,border-color .15s ease,color .15s ease,opacity .15s ease;
+}}
+button:not(:disabled):hover{{transform:translateY(-2px)}}
+button:not(:disabled):active{{transform:translateY(0) scale(.98)}}
+::selection{{background:rgba(37,99,235,.18)}}
 
-  /* Dropdown */
-  .Select-control { background: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; color: #c8d0e7 !important; min-height: 36px !important; height: 36px !important; }
-  .Select-control:hover { border-color: #6366f1 !important; }
-  .Select-value-label { color: #c8d0e7 !important; line-height: 34px !important; }
-  .Select-placeholder { color: #4a6fa5 !important; line-height: 34px !important; }
-  .Select-arrow { border-top-color: #3b82f6 !important; }
-  .Select-menu-outer { background: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; }
-  .VirtualizedSelectOption { background: #0e1428 !important; color: #c8d0e7 !important; font-size: 12px !important; }
-  .VirtualizedSelectFocusedOption { background: #1a2a50 !important; color: #fff !important; }
-  .Select-input input { color: #c8d0e7 !important; }
-  /* Dropdown modern Dash */
-  .dash-dropdown .Select-control, .dash-dropdown > div > div { background-color: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; }
-  .dash-dropdown .Select__control { background-color: #0e1428 !important; border-color: #3b82f6 !important; border-radius: 6px !important; min-height: 36px !important; }
-  .dash-dropdown .Select__control:hover { border-color: #6366f1 !important; }
-  .dash-dropdown .Select__single-value, .dash-dropdown .Select__placeholder { color: #c8d0e7 !important; }
-  .dash-dropdown .Select__placeholder { color: #4a6fa5 !important; }
-  .dash-dropdown .Select__menu { background-color: #0e1428 !important; border: 1px solid #3b82f6 !important; border-radius: 6px !important; }
-  .dash-dropdown .Select__option { background-color: #0e1428 !important; color: #c8d0e7 !important; }
-  .dash-dropdown .Select__option--is-focused { background-color: #1a2a50 !important; color: #fff !important; }
-  .dash-dropdown .Select__dropdown-indicator svg, .dash-dropdown .Select__indicator svg { color: #3b82f6 !important; }
-  .dash-dropdown .Select__input input, .dash-dropdown input { color: #c8d0e7 !important; background: transparent !important; }
+/* ── Scrollbar premium ── */
+::-webkit-scrollbar{{width:5px;height:5px}}
+::-webkit-scrollbar-track{{background:transparent}}
+::-webkit-scrollbar-thumb{{
+  background:linear-gradient(180deg,rgba(37,99,235,.42),rgba(139,92,246,.42));
+  border-radius:999px;
+}}
+::-webkit-scrollbar-thumb:hover{{
+  background:linear-gradient(180deg,rgba(37,99,235,.68),rgba(139,92,246,.68));
+}}
 
-  /* Plotly */
-  .js-plotly-plot .plotly .modebar { background: transparent !important; }
-  .js-plotly-plot .plotly .modebar-btn path { fill: #4a5270 !important; }
+/* ── Sidebar nav ── */
+.nav-item{{position:relative;overflow:hidden;transition:all .22s var(--ease-out)!important}}
+.nav-item::before{{
+  content:"";position:absolute;inset:0 auto 0 0;width:3px;
+  background:linear-gradient(180deg,#60a5fa,#a78bfa);opacity:0;
+  border-radius:0 3px 3px 0;
+  transition:opacity .22s ease!important;
+}}
+.nav-item::after{{
+  content:"";position:absolute;inset:0;opacity:0;pointer-events:none;
+  background:linear-gradient(100deg,rgba(96,165,250,.22),rgba(139,92,246,.10),transparent 72%);
+  transition:opacity .22s ease!important;
+}}
+.nav-item:hover{{
+  border-color:rgba(148,163,184,.30)!important;
+  transform:translateX(4px) scale(1.01)!important;
+  box-shadow:0 6px 28px rgba(37,99,235,.14)!important;
+}}
+.nav-item:hover::before,.nav-item:hover::after{{opacity:1}}
 
-  @keyframes pulse-dot { 0%,100% { opacity:1; } 50% { opacity:.4; } }
-  .live-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
-  @keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(239,68,68,.4); } 70% { box-shadow: 0 0 0 8px rgba(239,68,68,0); } 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); } }
-  .alert-pulse { animation: pulse-ring 2s ease-out infinite; }
+/* ── Cards ── */
+.card-hover{{
+  transition:transform .22s var(--ease-out),box-shadow .22s ease,
+    border-color .22s ease!important;
+}}
+.card-hover:hover{{
+  transform:translateY(-6px)!important;
+  box-shadow:0 36px 84px rgba(15,30,80,.16),0 0 0 1px rgba(37,99,235,.11)!important;
+  border-color:rgba(37,99,235,.16)!important;
+}}
 
-  .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr:hover td { background-color: #1a1f35 !important; cursor: pointer; }
-  .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr.selected td { background-color: #1a2540 !important; }
+/* ── Animations ── */
+@keyframes pulse{{
+  0%,100%{{opacity:1;transform:scale(1)}}
+  50%{{opacity:.3;transform:scale(.72)}}
+}}
+.pulse{{animation:pulse 1.9s ease-in-out infinite}}
 
-  .nav-btn { transition: all .15s; }
-  .nav-btn:hover { background-color: #161929 !important; color: #c8d0e7 !important; }
+@keyframes fadeUp{{
+  from{{opacity:0;transform:translateY(16px)}}
+  to{{opacity:1;transform:none}}
+}}
+.page-enter{{animation:fadeUp .3s var(--ease-out) both}}
+
+@keyframes slideInRight{{
+  from{{opacity:0;transform:translateX(34px) scale(.965)}}
+  to{{opacity:1;transform:none}}
+}}
+.rag-panel-enter{{animation:slideInRight .3s var(--ease-out) both}}
+
+@keyframes liveGlow{{
+  0%,100%{{
+    box-shadow:0 0 0 2px rgba(16,185,129,.18),0 6px 18px rgba(16,185,129,.14);
+  }}
+  50%{{
+    box-shadow:0 0 0 6px rgba(16,185,129,.0),0 6px 24px rgba(16,185,129,.24);
+  }}
+}}
+
+@keyframes floatOrb{{
+  0%,100%{{transform:translateY(0) scale(1)}}
+  50%{{transform:translateY(-12px) scale(1.04)}}
+}}
+
+@keyframes gradientShift{{
+  0%{{background-position:0% 50%}}
+  50%{{background-position:100% 50%}}
+  100%{{background-position:0% 50%}}
+}}
+
+/* ── Dropdown ── */
+.dash-dropdown .Select-control{{
+  height:44px!important;min-height:44px!important;
+  border:1.5px solid var(--border)!important;
+  border-radius:var(--r-sm)!important;
+  background:rgba(255,255,255,.97)!important;
+  box-shadow:var(--shadow-xs),inset 0 1px 0 rgba(255,255,255,.9)!important;
+  transition:border-color .2s,box-shadow .2s!important;
+}}
+.dash-dropdown .Select-control:hover,
+.dash-dropdown .is-focused:not(.is-open)>.Select-control{{
+  border-color:rgba(37,99,235,.55)!important;
+  box-shadow:0 0 0 4px rgba(37,99,235,.10),var(--shadow-sm)!important;
+}}
+.dash-dropdown .Select-placeholder,.dash-dropdown .Select-value-label{{
+  line-height:42px!important;font-size:12px!important;
+  font-weight:600!important;color:var(--muted)!important;
+}}
+.dash-dropdown .Select-menu-outer{{
+  z-index:9999!important;border:1.5px solid var(--border)!important;
+  border-radius:var(--r-md)!important;overflow:hidden;
+  box-shadow:var(--shadow-xl)!important;margin-top:7px!important;
+}}
+.dash-dropdown .VirtualizedSelectOption{{font-size:12px!important;padding:10px 14px!important}}
+.dash-dropdown .VirtualizedSelectFocusedOption{{
+  background:linear-gradient(90deg,#eff6ff,#f5f0ff)!important;
+  color:var(--blue)!important;
+}}
+
+/* ── Table ── */
+.dash-table-container,.dash-spreadsheet-container,.dash-spreadsheet-inner{{
+  width:100%!important;max-width:100%!important;
+}}
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr:hover td{{
+  background:linear-gradient(90deg,#eff6ff,#f5f2ff 55%,#eef5ff)!important;cursor:pointer;
+}}
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td[data-active=true]{{
+  background:linear-gradient(90deg,#dbeafe,#ede9fe 55%,#eef4ff)!important;
+  outline:none!important;
+  box-shadow:inset 3px 0 0 {BLUE},inset 0 0 0 1px rgba(37,99,235,.12)!important;
+}}
+.dash-table-container .previous-next-container{{
+  padding:12px 16px!important;border-top:1px solid var(--border-soft);
+  background:linear-gradient(180deg,#fafcff,#f4f8fe);
+}}
+
+/* ── Input focus ── */
+input[type=text]:focus,input[type=password]:focus{{
+  outline:none!important;
+  border-color:rgba(37,99,235,.55)!important;
+  box-shadow:0 0 0 4px rgba(37,99,235,.10)!important;
+}}
+
+/* ── Responsive ── */
+@media(max-width:1180px){{
+  .responsive-sidebar{{width:220px!important;min-width:220px!important}}
+}}
+@media(max-width:980px){{
+  .responsive-sidebar{{width:88px!important;min-width:88px!important}}
+  .sidebar-text{{display:none!important}}
+}}
 </style>
 </head>
-<body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body>
-</html>'''
+<body>
+{{%app_entry%}}
+<footer>{{%config%}}{{%scripts%}}{{%renderer%}}</footer>
+</body>
+</html>"""
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-C = {
-    "bg":      "#0b0d14", "sidebar": "#0d0f1a",
-    "surface": "#111420", "surface2": "#161929",
-    "border":  "#1e2236", "border2": "#252a42",
-    "text":    "#c8d0e7", "muted":   "#4a5270", "muted2": "#6b7494",
-    "danger":  "#ef4444", "success": "#22c55e",
-    "warning": "#f59e0b", "cyan":    "#38bdf8",
-    "blue":    "#3b82f6", "accent":  "#6366f1",
-}
-
-TABLE_COLS        = ["Timestamp", "Source", "Message", "Score IA", "Statut"]
-ALERT_TABLE_COLS  = ["Timestamp", "Source", "Host", "Message", "Score IA", "Ratio"]
-
-_HEADER = {
-    "backgroundColor": C["surface2"], "color": C["muted"],
-    "fontWeight": "600", "fontSize": "10px", "border": "none",
-    "borderBottom": f"1px solid {C['border']}",
-    "textTransform": "uppercase", "letterSpacing": "0.08em",
-    "padding": "10px 14px", "fontFamily": "'Space Mono', monospace", "whiteSpace": "nowrap",
-}
-_CELL = {
-    "backgroundColor": C["surface"], "color": C["text"],
-    "fontSize": "12px", "border": "none",
-    "borderBottom": f"1px solid {C['border']}",
-    "padding": "10px 14px", "overflow": "hidden",
-    "textOverflow": "ellipsis", "whiteSpace": "nowrap",
-    "fontFamily": "'DM Sans', sans-serif",
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
+# COMPOSANTS UI
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _nav_btn(icon, label, page_id, active_page):
-    active = (active_page == page_id)
-    return html.Button(
-        [html.Span(icon, style={"fontSize": "16px", "lineHeight": "1"}), html.Span(label)],
-        id=f"nav-btn-{page_id}",
-        n_clicks=0,
-        className="nav-btn",
+def _badge(text: str, color: str, background: str | None = None) -> html.Span:
+    return html.Span(
+        text,
         style={
-            "display": "flex", "alignItems": "center", "gap": "10px",
-            "width": "100%", "padding": "10px 14px", "borderRadius": "8px",
-            "border": "none", "cursor": "pointer", "textAlign": "left",
-            "backgroundColor": C["surface"] if active else "transparent",
-            "color": C["text"] if active else C["muted2"],
-            "fontSize": "13px", "fontWeight": "500",
-            "fontFamily": "'DM Sans', sans-serif",
-            "marginBottom": "2px",
-            "borderLeft": f"2px solid {C['accent']}" if active else "2px solid transparent",
+            "display": "inline-flex",
+            "alignItems": "center",
+            "padding": "4px 10px",
+            "borderRadius": "999px",
+            "fontSize": "10px",
+            "fontWeight": "800",
+            "color": color,
+            "backgroundColor": background or f"{color}18",
+            "fontFamily": "JetBrains Mono, monospace",
+            "letterSpacing": ".05em",
         },
     )
 
 
-def _sidebar(active_page="logs"):
-    return html.Div(style={
-        "width": "200px", "minWidth": "200px",
-        "backgroundColor": C["sidebar"],
-        "borderRight": f"1px solid {C['border']}",
-        "display": "flex", "flexDirection": "column",
-        "height": "100%",
-    }, children=[
-        # Logo
-        html.Div(style={
-            "padding": "20px 16px 18px",
-            "borderBottom": f"1px solid {C['border']}",
-            "display": "flex", "alignItems": "center", "gap": "10px",
-        }, children=[
-            html.Span("🛡️", style={"fontSize": "20px"}),
-            html.Div([
-                html.Span("LogGuardian", style={
-                    "fontSize": "13px", "fontWeight": "700", "color": C["text"],
-                    "fontFamily": "'DM Sans', sans-serif", "letterSpacing": "-0.01em",
-                }),
-                html.Div("AIOps Platform", style={
-                    "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.08em",
-                    "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                    "marginTop": "1px",
-                }),
-            ]),
-        ]),
 
-        # Nav
-        html.Div(style={"padding": "14px 10px", "flex": "1"}, children=[
-            _nav_btn("▦", "Dashboard",          "dashboard", active_page),
-            _nav_btn("☰", "Historique des Logs","logs",      active_page),
-            _nav_btn("⚠", "Alertes",            "alerts",    active_page),
-        ]),
-
-        # Kafka status
-        html.Div(id="kafka-status-indicator", style={
-            "padding": "14px 16px", "borderTop": f"1px solid {C['border']}",
-            "display": "flex", "alignItems": "center", "gap": "8px",
-        }, children=[
-            html.Div(className="live-dot", style={
-                "width": "7px", "height": "7px", "borderRadius": "50%",
-                "backgroundColor": C["success"],
-                "boxShadow": f"0 0 6px {C['success']}", "flexShrink": "0",
-            }),
-            html.Span("Kafka connecté", style={
-                "fontSize": "11px", "color": C["muted2"],
-                "fontFamily": "'Space Mono', monospace",
-            }),
-        ]),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TOPBAR helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _topbar(title, subtitle):
-    return html.Div(style={
-        "padding": "14px 20px",
-        "borderBottom": f"1px solid {C['border']}",
-        "backgroundColor": C["surface"],
-        "display": "flex", "alignItems": "center",
-        "justifyContent": "space-between", "flexShrink": "0",
-    }, children=[
-        html.Div([
-            html.H1(title, style={
-                "fontSize": "13px", "fontWeight": "700", "letterSpacing": "0.08em",
-                "color": C["text"], "fontFamily": "'Space Mono', monospace",
-            }),
-            html.P(subtitle, style={
-                "fontSize": "10px", "color": C["muted"],
-                "fontFamily": "'Space Mono', monospace", "marginTop": "1px",
-            }),
-        ]),
-        html.Div(style={
-            "display": "flex", "alignItems": "center", "gap": "8px",
-            "backgroundColor": C["surface2"], "border": f"1px solid {C['border2']}",
-            "borderRadius": "8px", "padding": "6px 12px",
-            "fontSize": "11px", "fontFamily": "'Space Mono', monospace", "color": C["muted2"],
-        }, children=[
-            html.Span("📅"),
-            html.Span(datetime.now().strftime("%A %d %B %Y").upper()),
-            html.Span("🕐"),
-            html.Span(id="time-display"),
-        ]),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# KPI CARD
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _kpi(icon, label, value_id, color=None, badge=None, initial_value="—"):
-    return html.Div(style={
-        "backgroundColor": C["surface"],
-        "border": f"1px solid {C['border']}",
-        "borderRadius": "10px", "padding": "16px 18px",
-        "flex": "1", "minWidth": "140px",
-        "borderTop": f"3px solid {color or C['accent']}",
-    }, children=[
-        html.Div(style={
-            "display": "flex", "justifyContent": "space-between",
-            "alignItems": "flex-start", "marginBottom": "10px",
-        }, children=[
-            html.Span(icon, style={"fontSize": "20px"}),
-            html.Span(badge or "", style={
-                "fontSize": "9px", "color": color or C["muted2"],
-                "fontFamily": "'Space Mono', monospace",
-                "letterSpacing": "0.06em",
-            }),
-        ]),
-        html.Div(id=value_id, style={
-            "fontSize": "26px", "fontWeight": "700",
-            "color": color or C["text"],
-            "fontFamily": "'Space Mono', monospace", "lineHeight": "1",
-        }, children=initial_value),
-        html.Div(label, style={
-            "fontSize": "10px", "color": C["muted"], "marginTop": "6px",
-            "textTransform": "uppercase", "letterSpacing": "0.07em",
-            "fontFamily": "'Space Mono', monospace",
-        }),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PLOTLY chart helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-_PLOT_LAYOUT = dict(
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(family="Space Mono, monospace", color="#6b7494", size=10),
-    margin=dict(l=40, r=16, t=16, b=36),
-    xaxis=dict(gridcolor="#1e2236", showgrid=True, zeroline=False,
-               tickfont=dict(size=9), linecolor="#1e2236"),
-    yaxis=dict(gridcolor="#1e2236", showgrid=True, zeroline=False,
-               tickfont=dict(size=9)),
-    legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=9)),
-    hovermode="x unified",
-)
-
-def _empty_fig(msg="En attente de données…"):
-    fig = go.Figure()
-    fig.update_layout(**_PLOT_LAYOUT,
-        annotations=[dict(text=msg, x=0.5, y=0.5, xref="paper",
-                          yref="paper", showarrow=False,
-                          font=dict(color="#4a5270", size=12))])
-    return fig
-
-def _anomaly_timeline_fig(rows):
-    """Anomalies sur les derniers événements reçus."""
-    if not rows:
-        return _empty_fig()
-
-    recent = list(reversed(rows[:50]))
-
-    labels = [str(i + 1) for i in range(len(recent))]
-    anomalies = [1 if r.get("Statut") == "ANOMALIE" else 0 for r in recent]
-    normals = [1 if r.get("Statut") == "NORMAL" else 0 for r in recent]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        name="Normal",
-        x=labels,
-        y=normals,
-        marker_color="#22c55e33",
-        marker_line_color="#22c55e",
-        marker_line_width=1
-    ))
-    fig.add_trace(go.Bar(
-        name="Anomalie",
-        x=labels,
-        y=anomalies,
-        marker_color="#ef444466",
-        marker_line_color="#ef4444",
-        marker_line_width=1
-    ))
-
-    fig.update_layout(
-        **_PLOT_LAYOUT,
-        barmode="stack",
-        yaxis_title="Événements",
-        xaxis_title="Derniers logs reçus"
-    )
-    return fig
-# def _anomaly_timeline_fig(rows):
-#     """Anomalies par minute sur les 30 dernières minutes."""
-#     if not rows:
-#         return _empty_fig()
-#     now = datetime.now()
-#     buckets = {}
-#     for i in range(30):
-#         t = (now - timedelta(minutes=i)).strftime("%H:%M")
-#         buckets[t] = {"anomalie": 0, "normal": 0}
-
-#     for r in rows:
-#         try:
-#             ts = datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M:%S")
-#             diff = (now - ts).total_seconds() / 60
-#             if 0 <= diff < 30:
-#                 key = ts.strftime("%H:%M")
-#                 if key in buckets:
-#                     if r.get("Statut") == "ANOMALIE":
-#                         buckets[key]["anomalie"] += 1
-#                     else:
-#                         buckets[key]["normal"] += 1
-#         except Exception:
-#             pass
-
-#     labels = sorted(buckets.keys())
-#     anomalies = [buckets[k]["anomalie"] for k in labels]
-#     normals   = [buckets[k]["normal"]   for k in labels]
-
-#     fig = go.Figure()
-#     fig.add_trace(go.Bar(name="Normal",   x=labels, y=normals,
-#                          marker_color="#22c55e33", marker_line_color="#22c55e",
-#                          marker_line_width=1))
-#     fig.add_trace(go.Bar(name="Anomalie", x=labels, y=anomalies,
-#                          marker_color="#ef444466", marker_line_color="#ef4444",
-#                          marker_line_width=1))
-#     fig.update_layout(**_PLOT_LAYOUT, barmode="stack",
-#                       yaxis_title="Événements")
-#     return fig
-
-def _score_timeline_fig(rows):
-    """Score IA sur les derniers événements reçus."""
-    if not rows:
-        return _empty_fig()
-
-    recent = list(reversed(rows[:50]))
-
-    xs = [str(i + 1) for i in range(len(recent))]
-    ys = [float(r.get("Score IA", 0)) for r in recent]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=xs,
-        y=ys,
-        mode="lines+markers",
-        name="Score IA",
-        line=dict(color="#6366f1", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(99,102,241,0.08)",
-    ))
-
-    fig.add_hline(
-        y=0.8,
-        line_dash="dash",
-        line_color="#ef4444",
-        annotation_text="Seuil critique",
-        annotation_font_size=9,
-        annotation_font_color="#ef4444"
-    )
-
-    layout = dict(**_PLOT_LAYOUT)
-    layout["yaxis"] = dict(**_PLOT_LAYOUT["yaxis"], range=[0, 1.05])
-
-    fig.update_layout(**layout, xaxis_title="Derniers logs reçus")
-    return fig
-
-# def _score_timeline_fig(rows):
-#     """Score IA moyen glissant."""
-#     if not rows:
-#         return _empty_fig()
-#     now = datetime.now()
-#     pts = []
-#     for r in rows:
-#         try:
-#             ts = datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M:%S")
-#             diff = (now - ts).total_seconds() / 60
-#             if 0 <= diff < 30:
-#                 pts.append((ts, float(r.get("Score IA", 0))))
-#         except Exception:
-#             pass
-#     if not pts:
-#         return _empty_fig()
-#     pts.sort(key=lambda x: x[0])
-#     xs = [p[0].strftime("%H:%M:%S") for p in pts]
-#     ys = [p[1] for p in pts]
-
-#     fig = go.Figure()
-#     fig.add_trace(go.Scatter(
-#         x=xs, y=ys, mode="lines", name="Score IA",
-#         line=dict(color="#6366f1", width=2),
-#         fill="tozeroy", fillcolor="rgba(99,102,241,0.08)",
-#     ))
-#     fig.add_hline(y=0.8, line_dash="dash", line_color="#ef4444",
-#                   annotation_text="Seuil critique", annotation_font_size=9,
-#                   annotation_font_color="#ef4444")
-#     fig.update_layout(**_PLOT_LAYOUT, yaxis=dict(range=[0, 1.05], **_PLOT_LAYOUT["yaxis"]))
-#     return fig
-
-
-def _services_fig(rows):
-    """Top services touchés par des anomalies."""
-    if not rows:
-        return _empty_fig()
-    counts = {}
-    for r in rows:
-        if r.get("Statut") == "ANOMALIE":
-            s = r.get("Source", "unknown")
-            counts[s] = counts.get(s, 0) + 1
-    if not counts:
-        return _empty_fig("Aucune anomalie détectée")
-    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:8]
-    labels = [t[0] for t in top]
-    values = [t[1] for t in top]
-
-    colors = ["#6366f1", "#3b82f6", "#38bdf8", "#22c55e",
-              "#f59e0b", "#ef4444", "#ec4899", "#8b5cf6"]
-
-    fig = go.Figure(go.Bar(
-        x=values, y=labels, orientation="h",
-        marker_color=colors[:len(labels)],
-        marker_line_width=0,
-    ))
-    layout = dict(**_PLOT_LAYOUT)
-    layout["margin"] = dict(l=120, r=16, t=16, b=36)
-    fig.update_layout(**layout, xaxis_title="Nb anomalies")
-    return fig
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DASHBOARD PAGE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _health_badge(label, ok=True):
-    color  = C["success"] if ok else C["danger"]
-    status = "OK" if ok else "DOWN"
-    return html.Div(style={
-        "display": "flex", "alignItems": "center", "gap": "10px",
-        "backgroundColor": C["surface2"],
-        "border": f"1px solid {C['border']}",
-        "borderLeft": f"3px solid {color}",
-        "borderRadius": "8px", "padding": "10px 14px", "flex": "1",
-    }, children=[
-        html.Div(style={
-            "width": "8px", "height": "8px", "borderRadius": "50%",
-            "backgroundColor": color,
-            "boxShadow": f"0 0 6px {color}",
-        }),
-        html.Div([
-            html.Div(label, style={
-                "fontSize": "11px", "color": C["text"], "fontWeight": "600",
-                "fontFamily": "'Space Mono', monospace",
-            }),
-            html.Div(status, style={
-                "fontSize": "10px", "color": color,
-                "fontFamily": "'Space Mono', monospace", "letterSpacing": "0.06em",
-            }),
-        ]),
-    ])
-
-
-def _chart_card(title, graph_id, initial_figure=None):
-    return html.Div(style={
-        "backgroundColor": C["surface"],
-        "border": f"1px solid {C['border']}",
-        "borderRadius": "10px", "overflow": "hidden", "flex": "1",
-    }, children=[
-        html.Div(title, style={
-            "padding": "12px 16px",
-            "borderBottom": f"1px solid {C['border']}",
-            "fontSize": "10px", "fontWeight": "700",
-            "color": C["muted"], "letterSpacing": "0.08em",
-            "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-        }),
-        dcc.Graph(id=graph_id, config={"displayModeBar": False},
-                  style={"height": "200px"},
-                  figure=initial_figure if initial_figure is not None else _empty_fig()),
-    ])
-
-
-def _page_dashboard(init_data=None):
-    d = init_data or {}
-    return html.Div(style={
-        "flex": "1", "display": "flex", "flexDirection": "column",
-        "overflow": "hidden", "minWidth": "0",
-    }, children=[
-        _topbar("DASHBOARD", "Vue globale — temps réel"),
-
-        html.Div(style={
-            "flex": "1", "overflow": "auto", "padding": "20px",
-        }, children=[
-
-            # KPI row
-            html.Div(style={"display": "flex", "gap": "14px", "marginBottom": "20px"}, children=[
-                _kpi("📊", "Total anomalies",   "kpi-total",     C["accent"],  "TOTAL",    d.get("total", "—")),
-                _kpi("🔴", "Sévérité haute",    "kpi-high",      C["danger"],  "> 1.3x",   d.get("high", "—")),
-                _kpi("⚡", "Score IA moyen",    "kpi-avg-score", C["blue"],    "MOY.",     d.get("avg_score", "—")),
-                _kpi("⏱️", "Anomalies total",   "kpi-rate",      C["warning"], "RATE",     d.get("rate", "—")),
-                _kpi("🖥️", "Services touchés",  "kpi-services",  C["cyan"],    "SERVICES", d.get("services", "—")),
-            ]),
-
-            # Charts row 1
-            html.Div(style={"display": "flex", "gap": "14px", "marginBottom": "14px"}, children=[
-                _chart_card("Anomalies — derniers logs reçus", "graph-timeline", d.get("fig_timeline")),
-                _chart_card("Score IA — derniers logs reçus","graph-score", d.get("fig_score")),
-            ]),
-
-            # Charts row 2 + Health
-            html.Div(style={"display": "flex", "gap": "14px"}, children=[
-                _chart_card("Top services touchés", "graph-services", d.get("fig_services")),
-
-                # Health panel
-                html.Div(style={
-                    "backgroundColor": C["surface"],
-                    "border": f"1px solid {C['border']}",
-                    "borderRadius": "10px", "flex": "1", "overflow": "hidden",
-                }, children=[
-                    html.Div("Health — Infrastructure", style={
-                        "padding": "12px 16px",
-                        "borderBottom": f"1px solid {C['border']}",
-                        "fontSize": "10px", "fontWeight": "700",
-                        "color": C["muted"], "letterSpacing": "0.08em",
-                        "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                    }),
-                    html.Div(id="health-panel", style={"padding": "14px", "display": "flex", "flexDirection": "column", "gap": "10px"},
-                             children=d.get("health", [])),
-                ]),
-            ]),
-        ]),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGS PAGE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _filter_bar():
-    return html.Div(style={
-        "padding": "14px 20px",
-        "borderBottom": f"1px solid {C['border']}",
-        "backgroundColor": C["surface2"], "flexShrink": "0",
-    }, children=[
-        html.Div("Recherche et filtrage dynamiques", style={
-            "fontSize": "10px", "color": C["muted"], "letterSpacing": "0.1em",
-            "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-            "marginBottom": "10px",
-        }),
-        html.Div(style={
-            "display": "grid",
-            "gridTemplateColumns": "1fr 160px 160px 140px", "gap": "10px",
-        }, children=[
-            dcc.Input(
-                id="search-text", type="text", debounce=False,
-                placeholder="Filtrer par mots-clés : timeout, 404, injection, host...",
+def _topbar(title: str, subtitle: str, clock_id: str) -> html.Div:
+    return html.Div(
+        style={
+            "height": "72px",
+            "minHeight": "72px",
+            "display": "flex",
+            "alignItems": "center",
+            "justifyContent": "space-between",
+            "padding": "0 28px",
+            "background": "rgba(255,255,255,.82)",
+            "backdropFilter": "blur(24px)",
+            "WebkitBackdropFilter": "blur(24px)",
+            "borderBottom": f"1px solid {BD}",
+            "boxShadow": "0 1px 0 rgba(255,255,255,.9),0 6px 24px rgba(15,23,42,.042)",
+            "flexShrink": "0",
+            "zIndex": "5",
+            "position": "relative",
+        },
+        children=[
+            html.Div(
+                style={"display": "flex", "flexDirection": "column", "gap": "4px"},
+                children=[
+                    html.Div(
+                        title,
+                        style={
+                            "fontSize": "22px",
+                            "fontWeight": "900",
+                            "letterSpacing": "-.045em",
+                            "lineHeight": "1.1",
+                            "background": "linear-gradient(135deg,#0f172a 0%,#1e40af 100%)",
+                            "WebkitBackgroundClip": "text",
+                            "WebkitTextFillColor": "transparent",
+                            "backgroundClip": "text",
+                        },
+                    ),
+                    html.Div(
+                        subtitle,
+                        style={
+                            "fontSize": "11px",
+                            "fontWeight": "500",
+                            "color": MUT,
+                            "letterSpacing": ".01em",
+                        },
+                    ),
+                ],
+            ),
+            html.Div(
+                style={"display": "flex", "alignItems": "center", "gap": "10px"},
+                children=[
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "gap": "8px",
+                            "color": GREEN,
+                            "background": "linear-gradient(180deg,#f0fdf4,#dcfce7)",
+                            "border": "1.5px solid #86efac",
+                            "borderRadius": "999px",
+                            "padding": "7px 14px",
+                            "fontSize": "10px",
+                            "fontWeight": "900",
+                            "letterSpacing": ".10em",
+                            "animation": "liveGlow 2.4s ease-in-out infinite",
+                        },
+                        children=[
+                            html.Span(
+                                className="pulse",
+                                style={
+                                    "width": "7px",
+                                    "height": "7px",
+                                    "display": "inline-block",
+                                    "borderRadius": "50%",
+                                    "background": "linear-gradient(135deg,#34d399,#10b981)",
+                                    "boxShadow": "0 0 0 3px rgba(16,185,129,.18)",
+                                },
+                            ),
+                            html.Span("LIVE"),
+                        ],
+                    ),
+                    html.Div(
+                        id=clock_id,
+                        style={
+                            "fontFamily": "JetBrains Mono, monospace",
+                            "fontSize": "10px",
+                            "fontWeight": "700",
+                            "color": MUT,
+                            "background": "linear-gradient(180deg,#ffffff,#f8fafc)",
+                            "border": f"1.5px solid {BD}",
+                            "padding": "8px 13px",
+                            "borderRadius": "12px",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.05),inset 0 1px 0 rgba(255,255,255,.9)",
+                        },
+                    ),
+                ],
+            ),
+            html.Div(
                 style={
-                    "width": "100%", "height": "36px",
-                    "backgroundColor": "#0e1428", "border": "1px solid #3b82f6",
-                    "borderRadius": "6px", "color": C["text"], "padding": "0 12px",
-                    "outline": "none", "fontSize": "12px",
-                    "fontFamily": "'DM Sans', sans-serif",
+                    "position": "absolute",
+                    "bottom": "0",
+                    "left": "0",
+                    "right": "0",
+                    "height": "2px",
+                    "background": "linear-gradient(90deg,transparent 0%,rgba(96,165,250,.5) 25%,rgba(167,139,250,.6) 50%,rgba(96,165,250,.5) 75%,transparent 100%)",
+                    "opacity": ".6",
+                }
+            ),
+        ],
+    )
+
+
+def _sidebar() -> html.Div:
+    def nav_button(
+        page_id: str,
+        icon: str,
+        label: str,
+        subtitle: str,
+    ) -> html.Button:
+        return html.Button(
+            id=f"nav-{page_id}",
+            n_clicks=0,
+            className="nav-item",
+            style={
+                "width": "100%",
+                "border": "1px solid rgba(148,163,184,.08)",
+                "background": "rgba(255,255,255,.025)",
+                "color": "white",
+                "padding": "11px 12px",
+                "borderRadius": "14px",
+                "display": "flex",
+                "alignItems": "center",
+                "gap": "12px",
+                "textAlign": "left",
+                "cursor": "pointer",
+                "marginBottom": "7px",
+            },
+            children=[
+                html.Div(
+                    icon,
+                    style={
+                        "width": "38px",
+                        "height": "38px",
+                        "minWidth": "38px",
+                        "borderRadius": "12px",
+                        "display": "grid",
+                        "placeItems": "center",
+                        "background": (
+                            "linear-gradient("
+                            "145deg,"
+                            "rgba(96,165,250,.18),"
+                            "rgba(139,92,246,.12)"
+                            ")"
+                        ),
+                        "fontSize": "16px",
+                        "border": (
+                            "1px solid rgba(148,163,184,.13)"
+                        ),
+                    },
+                ),
+                html.Div(
+                    className="sidebar-text",
+                    children=[
+                        html.Div(
+                            label,
+                            style={
+                                "fontWeight": "800",
+                                "fontSize": "13px",
+                            },
+                        ),
+                        html.Div(
+                            subtitle,
+                            style={
+                                "fontSize": "9px",
+                                "fontWeight": "500",
+                                "color": "#7f91b3",
+                                "marginTop": "3px",
+                            },
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+    return html.Div(
+        className="responsive-sidebar",
+        style={
+            "width": "262px",
+            "minWidth": "262px",
+            "height": "100vh",
+            "position": "relative",
+            "overflow": "hidden",
+            "background": (
+                f"linear-gradient("
+                f"180deg,"
+                f"{SIDE} 0%,"
+                f"{SIDE2} 58%,"
+                f"#0b1730 100%"
+                f")"
+            ),
+            "display": "flex",
+            "flexDirection": "column",
+            "boxShadow": (
+                "10px 0 40px rgba(7,18,37,.22)"
+            ),
+            "zIndex": "10",
+        },
+        children=[
+            # Halo décoratif
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "180px",
+                    "height": "180px",
+                    "borderRadius": "50%",
+                    "background": "rgba(37,99,235,.16)",
+                    "filter": "blur(52px)",
+                    "top": "-70px",
+                    "right": "-70px",
+                    "pointerEvents": "none",
+                }
+            ),
+
+            # Logo
+            html.Div(
+                style={
+                    "padding": "24px 19px 18px",
+                    "position": "relative",
+                },
+                children=[
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "gap": "13px",
+                        },
+                        children=[
+                            html.Div(
+                                "◈",
+                                style={
+                                    "width": "50px",
+                                    "height": "50px",
+                                    "minWidth": "50px",
+                                    "borderRadius": "18px",
+                                    "display": "grid",
+                                    "placeItems": "center",
+                                    "fontSize": "24px",
+                                    "color": "white",
+                                    "background": (
+                                        "linear-gradient("
+                                        "135deg,"
+                                        "#60a5fa 0%,"
+                                        "#3b82f6 40%,"
+                                        "#7c3aed 100%"
+                                        ")"
+                                    ),
+                                    "boxShadow": (
+                                        "0 16px 38px rgba(37,99,235,.48),"
+                                        "inset 0 1px 0 rgba(255,255,255,.22)"
+                                    ),
+                                },
+                            ),
+                            html.Div(
+                                className="sidebar-text",
+                                children=[
+                                    html.Div(
+                                        "LogGuardian",
+                                        style={
+                                            "fontSize": "18px",
+                                            "fontWeight": "900",
+                                            "color": "white",
+                                            "letterSpacing": "-.035em",
+                                        },
+                                    ),
+                                    html.Div(
+                                        "AIOps Command Center",
+                                        style={
+                                            "fontSize": "9px",
+                                            "fontWeight": "600",
+                                            "color": "#7f91b3",
+                                            "marginTop": "3px",
+                                            "letterSpacing": ".05em",
+                                            "textTransform": "uppercase",
+                                        },
+                                    ),
+                                ],
+                            ),
+                        ],
+                    )
+                ],
+            ),
+
+            # Séparateur
+            html.Div(
+                style={
+                    "height": "1px",
+                    "background": (
+                        "linear-gradient("
+                        "90deg,"
+                        "transparent,"
+                        "rgba(148,163,184,.18),"
+                        "transparent"
+                        ")"
+                    ),
+                    "margin": "0 16px 17px",
+                }
+            ),
+
+            # Titre navigation
+            html.Div(
+                "Navigation",
+                className="sidebar-text",
+                style={
+                    "fontSize": "9px",
+                    "fontWeight": "800",
+                    "color": "#42577d",
+                    "letterSpacing": ".16em",
+                    "padding": "0 20px 11px",
+                    "textTransform": "uppercase",
+                    "fontFamily": (
+                        "JetBrains Mono, monospace"
+                    ),
                 },
             ),
-            dcc.Dropdown(id="source-filter", placeholder="SERVICE", clearable=True,
-                         style={"fontSize": "11px"}),
-            dcc.Dropdown(id="level-filter", placeholder="NIVEAU", clearable=True,
-                         options=[
-                             {"label": "Toutes sévérités", "value": "all"},
-                             {"label": "ANOMALIE (> 1.3x)", "value": "high"},
-                             {"label": "NORMAL (≤ 1.3x)",  "value": "normal"},
-                         ], value="all", style={"fontSize": "11px"}),
-            dcc.Dropdown(id="limit-filter", placeholder="PÉRIODE", clearable=False,
-                         options=[
-                             {"label": "Temps réel", "value": 200},
-                             {"label": "1 heure",    "value": 500},
-                             {"label": "24 heures",  "value": MAX_ROWS},
-                         ], value=200, style={"fontSize": "11px"}),
-        ]),
-    ])
 
-
-def _rag_panel():
-    return html.Div(id="rag-panel", style={
-        "width": "300px", "minWidth": "300px",
-        "backgroundColor": C["surface"],
-        "borderLeft": f"1px solid {C['border']}",
-        "display": "flex", "flexDirection": "column", "height": "100%",
-    }, children=[
-        html.Div(style={
-            "padding": "14px 16px", "borderBottom": f"1px solid {C['border']}",
-            "display": "flex", "alignItems": "center", "justifyContent": "space-between",
-        }, children=[
-            html.Div(style={"display": "flex", "alignItems": "center", "gap": "8px"}, children=[
-                html.Div("⚡", style={
-                    "width": "26px", "height": "26px", "borderRadius": "6px",
-                    "background": f"linear-gradient(135deg, {C['accent']}, {C['blue']})",
-                    "display": "flex", "alignItems": "center", "justifyContent": "center",
-                    "fontSize": "13px",
-                }),
-                html.Span("EXPLICATION IA (RAG)", style={
-                    "fontSize": "10px", "fontWeight": "700", "color": C["text"],
-                    "letterSpacing": "0.08em", "fontFamily": "'Space Mono', monospace",
-                }),
-            ]),
-        ]),
-        html.Div(id="rag-content", style={"flex": "1", "overflow": "auto", "padding": "16px"},
-                 children=_rag_empty()),
-    ])
-
-
-def _rag_empty():
-    return html.Div(style={
-        "display": "flex", "flexDirection": "column",
-        "alignItems": "center", "justifyContent": "center",
-        "height": "100%", "color": C["muted"], "textAlign": "center",
-    }, children=[
-        html.Div("⚡", style={"fontSize": "32px", "marginBottom": "12px", "opacity": "0.3"}),
-        html.P("Sélectionnez un log dans le tableau pour voir l'analyse IA",
-               style={"fontSize": "12px", "lineHeight": "1.6",
-                      "fontFamily": "'DM Sans', sans-serif"}),
-    ])
-
-
-def _rag_card(row):
-    is_anomaly = row.get("Statut") == "ANOMALIE"
-    score = float(row.get("Score IA", 0))
-    return html.Div(style={"fontFamily": "'DM Sans', sans-serif"}, children=[
-        # Description
-        html.Div(style={"marginBottom": "14px"}, children=[
-            html.Div("DESCRIPTION DU LOG SÉLECTIONNÉ", style={
-                "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.1em",
-                "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                "marginBottom": "8px",
-            }),
-            html.Div(style={
-                "backgroundColor": C["surface2"], "border": f"1px solid {C['border2']}",
-                "borderRadius": "6px", "padding": "10px 12px",
-                "fontSize": "12px", "color": C["text"], "lineHeight": "1.6",
-            }, children=row.get("Message", "—")[:150]),
-        ]),
-        # Score bar
-        html.Div(style={"marginBottom": "14px"}, children=[
-            html.Div(style={"display": "flex", "justifyContent": "space-between", "marginBottom": "6px"}, children=[
-                html.Span("Score IA", style={"fontSize": "11px", "color": C["muted2"]}),
-                html.Span(f"{score:.2f}", style={
-                    "fontSize": "11px", "fontWeight": "700",
-                    "color": C["danger"] if is_anomaly else C["success"],
-                    "fontFamily": "'Space Mono', monospace",
-                }),
-            ]),
-            html.Div(style={
-                "height": "4px", "backgroundColor": C["border2"],
-                "borderRadius": "2px", "overflow": "hidden",
-            }, children=[
-                html.Div(style={
-                    "height": "100%", "width": f"{min(score * 100, 100):.0f}%",
-                    "background": f"linear-gradient(90deg, {C['blue']}, {C['danger'] if is_anomaly else C['success']})",
-                    "borderRadius": "2px",
-                }),
-            ]),
-        ]),
-        # Analysis
-        html.Div(style={"marginBottom": "14px"}, children=[
-            html.Div("ANALYSE DU MODÈLE RAG", style={
-                "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.1em",
-                "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                "marginBottom": "8px",
-            }),
-            html.Div(style={
-                "backgroundColor": C["surface2"],
-                "border": f"1px solid {'rgba(239,68,68,0.25)' if is_anomaly else C['border2']}",
-                "borderRadius": "6px", "padding": "10px 12px 10px 18px",
-                "fontSize": "12px", "color": C["text"], "lineHeight": "1.7",
-                "borderLeft": f"3px solid {C['danger'] if is_anomaly else C['success']}",
-            }, children=(
-                f"Ce log indique une tentative d'injection SQL sur le port 80. "
-                f"Score d'anomalie élevé ({score:.2f}/1.0). "
-                f"Pattern récurrent détecté sur le service {row.get('Source', 'inconnu')}."
-            ) if is_anomaly else (
-                f"Log de routine — comportement nominal détecté. "
-                f"Score {score:.2f} en dessous du seuil d'alerte. Aucune action requise."
-            )),
-        ]),
-        # Action
-        html.Div(children=[
-            html.Div("ACTION SUGGÉRÉE", style={
-                "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.1em",
-                "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-                "marginBottom": "8px",
-            }),
-            html.Div(style={
-                "background": f"linear-gradient(135deg, {C['accent']}22, {C['blue']}22)",
-                "border": f"1px solid {C['accent']}44",
-                "borderRadius": "6px", "padding": "10px 12px",
-            }, children=[
-                html.Span(
-                    "🔄 RESTART DU POD RECOMMANDÉ" if is_anomaly else "✅ AUCUNE ACTION REQUISE",
-                    style={
-                        "fontSize": "11px", "fontWeight": "700", "color": C["text"],
-                        "letterSpacing": "0.04em", "fontFamily": "'Space Mono', monospace",
-                    }
-                ),
-                html.P(
-                    "Lien direct vers l'action Kubernetes" if is_anomaly else "Continuer la surveillance normale",
-                    style={"fontSize": "11px", "color": C["muted2"], "marginTop": "4px"}
-                ),
-            ]),
-        ]),
-    ])
-
-
-def _page_logs():
-    return html.Div(style={
-        "flex": "1", "display": "flex", "flexDirection": "column",
-        "overflow": "hidden", "minWidth": "0",
-    }, children=[
-        _topbar("HISTORIQUE DES LOGS", "(Spark Streaming)"),
-
-        # Metrics mini bar
-        html.Div(id="metrics-bar", style={
-            "display": "flex", "gap": "20px", "alignItems": "center",
-            "padding": "8px 20px",
-            "backgroundColor": C["surface2"],
-            "borderBottom": f"1px solid {C['border']}",
-            "flexShrink": "0",
-        }),
-
-        _filter_bar(),
-
-        html.Div(style={
-            "flex": "1", "display": "flex", "flexDirection": "row",
-            "overflow": "hidden", "minHeight": "0",
-        }, children=[
-            # Table
-            html.Div(style={"flex": "1", "overflow": "auto", "minWidth": "0"}, children=[
-                dash_table.DataTable(
-                    id="main-table",
-                    columns=[{"name": c, "id": c} for c in TABLE_COLS],
-                    data=[],
-                    style_table={"overflowX": "auto", "width": "100%"},
-                    style_header=_HEADER, style_cell=_CELL,
-                    style_cell_conditional=[
-                        {"if": {"column_id": "Message"}, "whiteSpace": "normal", "textOverflow": "clip", "maxWidth": "0"},
-                        {"if": {"column_id": "Timestamp"}, "width": "155px", "minWidth": "155px",
-                         "fontFamily": "'Space Mono', monospace", "fontSize": "11px", "color": C["muted2"]},
-                        {"if": {"column_id": "Source"}, "width": "160px", "minWidth": "120px",
-                         "color": C["cyan"], "fontFamily": "'Space Mono', monospace", "fontSize": "11px"},
-                        {"if": {"column_id": "Score IA"}, "width": "80px", "minWidth": "80px",
-                         "textAlign": "center", "fontFamily": "'Space Mono', monospace", "fontWeight": "700"},
-                        {"if": {"column_id": "Statut"}, "width": "110px", "minWidth": "110px", "textAlign": "center"},
-                    ],
-                    style_data_conditional=[
-                        {"if": {"filter_query": '{Statut} = "ANOMALIE"', "column_id": "Statut"},
-                         "color": C["danger"], "fontWeight": "700",
-                         "fontFamily": "'Space Mono', monospace", "fontSize": "10px", "letterSpacing": "0.06em"},
-                        {"if": {"filter_query": '{Statut} = "NORMAL"', "column_id": "Statut"},
-                         "color": C["success"], "fontFamily": "'Space Mono', monospace",
-                         "fontSize": "10px", "letterSpacing": "0.06em"},
-                        {"if": {"filter_query": '{Statut} = "ANOMALIE"', "column_id": "Score IA"}, "color": C["danger"]},
-                        {"if": {"filter_query": '{Statut} = "NORMAL"', "column_id": "Score IA"}, "color": C["success"]},
-                        {"if": {"row_index": "odd"}, "backgroundColor": C["surface2"]},
-                    ],
-                    page_size=60, sort_action="native",
-                    row_selectable="single", selected_rows=[],
-                ),
-            ]),
-            _rag_panel(),
-        ]),
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ALERTS PAGE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _page_alerts():
-    return html.Div(style={
-        "flex": "1", "display": "flex", "flexDirection": "column",
-        "overflow": "hidden", "minWidth": "0",
-    }, children=[
-        _topbar("ALERTES CRITIQUES", "Anomalies avec ratio > 1.3x uniquement"),
-
-        # Alert summary bar
-        html.Div(style={
-            "padding": "12px 20px",
-            "backgroundColor": "rgba(239,68,68,0.06)",
-            "borderBottom": f"1px solid rgba(239,68,68,0.2)",
-            "display": "flex", "alignItems": "center", "gap": "16px",
-            "flexShrink": "0",
-        }, children=[
-            html.Div(style={
-                "width": "10px", "height": "10px", "borderRadius": "50%",
-                "backgroundColor": C["danger"],
-                "boxShadow": f"0 0 8px {C['danger']}",
-            }, className="alert-pulse"),
-            html.Span(id="alert-summary", style={
-                "fontSize": "12px", "color": C["danger"],
-                "fontFamily": "'Space Mono', monospace", "fontWeight": "700",
-            }),
-            html.Span("—", style={"color": C["muted"]}),
-            html.Span(id="alert-last-seen", style={
-                "fontSize": "11px", "color": C["muted2"],
-                "fontFamily": "'Space Mono', monospace",
-            }),
-        ]),
-
-        # Alerts table
-        html.Div(style={"flex": "1", "overflow": "auto"}, children=[
-            dash_table.DataTable(
-                id="alert-table",
-                columns=[{"name": c, "id": c} for c in ALERT_TABLE_COLS],
-                data=[],
-                style_table={"overflowX": "auto", "width": "100%"},
-                style_header=_HEADER,
-                style_cell={**_CELL, "backgroundColor": "#0f0a0a"},
-                style_cell_conditional=[
-                    {"if": {"column_id": "Message"}, "whiteSpace": "normal", "textOverflow": "clip", "maxWidth": "0"},
-                    {"if": {"column_id": "Timestamp"}, "width": "155px", "minWidth": "155px",
-                     "fontFamily": "'Space Mono', monospace", "fontSize": "11px", "color": C["muted2"]},
-                    {"if": {"column_id": "Source"}, "width": "160px",
-                     "color": C["danger"], "fontFamily": "'Space Mono', monospace", "fontSize": "11px"},
-                    {"if": {"column_id": "Host"}, "width": "120px",
-                     "fontFamily": "'Space Mono', monospace", "fontSize": "11px"},
-                    {"if": {"column_id": "Score IA"}, "width": "80px", "textAlign": "center",
-                     "fontFamily": "'Space Mono', monospace", "fontWeight": "700", "color": C["danger"]},
-                    {"if": {"column_id": "Ratio"}, "width": "80px", "textAlign": "center",
-                     "fontFamily": "'Space Mono', monospace", "fontWeight": "700", "color": C["warning"]},
+            # Navigation principale
+            html.Div(
+                style={
+                    "padding": "0 12px",
+                    "flex": "1",
+                    "minHeight": "0",
+                    "overflowY": "auto",
+                },
+                children=[
+                    nav_button(
+                        "dashboard",
+                        "▦",
+                        "Vue cockpit",
+                        "KPIs · graphes · risque",
+                    ),
+                    nav_button(
+                        "logs",
+                        "≡",
+                        "Flux logs",
+                        "Recherche · IA · feedback",
+                    ),
+                    nav_button(
+                        "alerts",
+                        "⚠",
+                        "Incident board",
+                        "Anomalies critiques",
+                    ),
                 ],
-                style_data_conditional=[
-                    {"if": {"row_index": "odd"}, "backgroundColor": "#120a0a"},
-                ],
-                page_size=50, sort_action="native",
             ),
-        ]),
-    ])
 
+            # Bouton de déconnexion
+            html.Button(
+                id="logout-button",
+                n_clicks=0,
+                title="Se déconnecter",
+                style={
+                    "width": "calc(100% - 28px)",
+                    "height": "44px",
+                    "margin": "8px 14px 10px",
+                    "padding": "0 13px",
+                    "borderRadius": "13px",
+                    "border": (
+                        "1px solid rgba(248,113,113,.22)"
+                    ),
+                    "background": (
+                        "linear-gradient("
+                        "145deg,"
+                        "rgba(248,113,113,.11),"
+                        "rgba(239,68,68,.055)"
+                        ")"
+                    ),
+                    "color": "#fca5a5",
+                    "fontWeight": "800",
+                    "fontSize": "11px",
+                    "cursor": "pointer",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "justifyContent": "center",
+                    "gap": "9px",
+                    "boxShadow": (
+                        "0 8px 20px rgba(127,29,29,.08)"
+                    ),
+                },
+                children=[
+                    html.Span(
+                        "⏻",
+                        style={
+                            "fontSize": "16px",
+                            "lineHeight": "1",
+                        },
+                    ),
+                    html.Span(
+                        "Déconnexion",
+                        className="sidebar-text",
+                    ),
+                ],
+            ),
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ROOT LAYOUT
-# ─────────────────────────────────────────────────────────────────────────────
-
-app.layout = html.Div(style={
-    "backgroundColor": C["bg"], "height": "100vh",
-    "display": "flex", "flexDirection": "row",
-    "fontFamily": "'DM Sans', sans-serif", "color": C["text"],
-    "overflow": "hidden",
-}, children=[
-    # Sidebar — rebuilt via callback to update active state
-    html.Div(id="sidebar-container", style={"display": "flex"}),
-
-    # Page content
-    html.Div(id="page-content", style={
-        "flex": "1", "display": "flex", "overflow": "hidden", "minWidth": "0",
-    }),
-
-    # Stores & intervals
-    dcc.Interval(id="interval", interval=REFRESH_INTERVAL_MS, n_intervals=0),
-    dcc.Store(id="current-page", data="logs"),
-    dcc.Store(id="rows-store",   data=[]),
-    dcc.Store(id="selected-row-store", data=None),
-])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CALLBACKS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.callback(
-    Output("current-page", "data"),
-    Input("nav-btn-dashboard", "n_clicks"),
-    Input("nav-btn-logs",      "n_clicks"),
-    Input("nav-btn-alerts",    "n_clicks"),
-    State("current-page", "data"),
-    prevent_initial_call=True,
-)
-def navigate(n_dashboard, n_logs, n_alerts, current):
-    ctx = callback_context
-    if not ctx.triggered:
-        return current
-    btn_id = ctx.triggered[0]["prop_id"].split(".")[0]
-    mapping = {
-        "nav-btn-dashboard": "dashboard",
-        "nav-btn-logs":      "logs",
-        "nav-btn-alerts":    "alerts",
-    }
-    return mapping.get(btn_id, current)
-
-
-def _compute_dashboard_data():
-    with _lock:
-        rows  = list(_buffer)
-        total = _total_received
-
-    high_rows  = [r for r in rows if r.get("_ratio_val", 0) > 1.3]
-    scores     = [r.get("_score_val", 0) for r in rows if "_score_val" in r]
-    avg_score  = sum(scores) / len(scores) if scores else 0
-    services   = len({r["Source"] for r in high_rows if r.get("Source")})
-    rate       = len(high_rows)
-
-    health = [
-        _health_badge("Kafka Broker",       ok=True),
-        _health_badge("Kubernetes Cluster", ok=True),
-        _health_badge("ML Model API",       ok=total > 0),
-        _health_badge("Spark Streaming",    ok=total > 0),
-    ]
-
-    display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-
-    return {
-        "total":        str(total),
-        "high":         str(len(high_rows)),
-        "avg_score":    f"{avg_score:.3f}",
-        "rate":         str(rate),
-        "services":     str(services),
-        "fig_timeline": _anomaly_timeline_fig(display_rows),
-        "fig_score":    _score_timeline_fig(display_rows),
-        "fig_services": _services_fig(rows),
-        "health":       health,
-    }
-
-
-@app.callback(
-    Output("sidebar-container", "children"),
-    Output("page-content",      "children"),
-    Input("current-page", "data"),
-)
-def render_page(page):
-    sidebar = _sidebar(active_page=page)
-    if page == "dashboard":
-        content = _page_dashboard(init_data=_compute_dashboard_data())
-    elif page == "alerts":
-        content = _page_alerts()
-    else:
-        content = _page_logs()
-    return sidebar, content
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _apply_filters(rows, search_text, source_filter, level_filter, limit_filter):
-    search_text  = (search_text or "").lower().strip()
-    level_filter = level_filter or "all"
-    limit_filter = int(limit_filter or 200)
-    filtered = []
-    for r in rows:
-        searchable = " ".join([r.get("Timestamp",""), r.get("Source",""),
-                               r.get("Message",""), r.get("Score IA","")]).lower()
-        if search_text and search_text not in searchable:
-            continue
-        if source_filter and r.get("Source") != source_filter:
-            continue
-        if level_filter == "high"   and r.get("_ratio_val", 0) <= 1.3: continue
-        if level_filter == "normal" and r.get("_ratio_val", 0) >  1.3: continue
-        filtered.append(r)
-    return filtered[:limit_filter]
-
-
-def _mini_metric(label, value, color=None):
-    return html.Div(style={"textAlign": "center"}, children=[
-        html.Div(value, style={
-            "fontSize": "18px", "fontWeight": "700",
-            "color": color or C["text"], "fontFamily": "'Space Mono', monospace",
-        }),
-        html.Div(label, style={
-            "fontSize": "9px", "color": C["muted"], "letterSpacing": "0.08em",
-            "textTransform": "uppercase", "fontFamily": "'Space Mono', monospace",
-        }),
-    ])
-
-
-# ── Logs page callbacks ───────────────────────────────────────────────────────
-
-@app.callback(
-    Output("metrics-bar",   "children"),
-    Output("time-display",  "children"),
-    Output("main-table",    "data"),
-    Output("source-filter", "options"),
-    Output("rows-store",    "data"),
-    Input("interval",       "n_intervals"),
-    Input("search-text",    "value"),
-    Input("source-filter",  "value"),
-    Input("level-filter",   "value"),
-    Input("limit-filter",   "value"),
-    prevent_initial_call=False,
-)
-def refresh_logs(_, search_text, source_filter, level_filter, limit_filter):
-    with _lock:
-        rows  = [r for r in _buffer if "_ratio_val" in r]
-        total = _total_received
-
-    source_options = [{"label": s, "value": s}
-                      for s in sorted({r["Source"] for r in rows if r.get("Source")})]
-
-    filtered     = _apply_filters(rows, search_text, source_filter, level_filter, limit_filter)
-    high_count   = sum(1 for r in filtered if r.get("_ratio_val", 0) > 1.3)
-    sources_count = len({r["Source"] for r in filtered}) if filtered else 0
-    display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in filtered]
-
-    metrics = [
-        _mini_metric("Total",     str(total)),
-        html.Div(style={"width":"1px","backgroundColor":C["border"],"margin":"0 4px"}),
-        _mini_metric("Anomalies", str(high_count),    C["danger"] if high_count else C["muted"]),
-        html.Div(style={"width":"1px","backgroundColor":C["border"],"margin":"0 4px"}),
-        _mini_metric("Sources",   str(sources_count)),
-        html.Div(style={"width":"1px","backgroundColor":C["border"],"margin":"0 4px"}),
-        _mini_metric("Topic",     KAFKA_TOPIC[:14],   C["muted"]),
-    ]
-
-    store_rows = [{k: v for k, v in r.items() if k != "_seq"} for r in filtered]
-    now_time   = datetime.now().strftime("%H:%M:%S")
-    return metrics, now_time, display_rows, source_options, store_rows
-
-
-@app.callback(
-    Output("main-table", "selected_rows"),
-    Input("main-table",  "selected_rows"),
-    State("selected-row-store", "data"),
-    prevent_initial_call=True,
-)
-def preserve_selection(selected_rows, stored):
-    if selected_rows:
-        return selected_rows
-    if stored is not None:
-        return [stored]
-    return []
-
-
-@app.callback(
-    Output("selected-row-store", "data"),
-    Input("main-table", "selected_rows"),
-    prevent_initial_call=True,
-)
-def save_selection(selected_rows):
-    if selected_rows:
-        return selected_rows[0]
-    return dash.no_update
-
-
-@app.callback(
-    Output("rag-content", "children"),
-    Input("main-table",   "selected_rows"),
-    State("rows-store",   "data"),
-)
-def show_rag(selected_rows, store_data):
-    if not selected_rows or not store_data:
-        return _rag_empty()
-    idx = selected_rows[0]
-    if idx >= len(store_data):
-        return html.P("Données non disponibles.", style={"color": C["muted"], "fontSize": "12px"})
-    return _rag_card(store_data[idx])
-
-
-# ── Dashboard callbacks ───────────────────────────────────────────────────────
-@app.callback(
-    Output("kpi-total",     "children"),
-    Output("kpi-high",      "children"),
-    Output("kpi-avg-score", "children"),
-    Output("kpi-rate",      "children"),
-    Output("kpi-services",  "children"),
-    Output("graph-timeline","figure"),
-    Output("graph-score",   "figure"),
-    Output("graph-services","figure"),
-    Output("health-panel",  "children"),
-    Input("interval", "n_intervals"),
-    State("current-page", "data"),
-)
-def refresh_dashboard(_, page):
-    if page != "dashboard":
-        raise dash.exceptions.PreventUpdate
-
-    d = _compute_dashboard_data()
-    return (
-        d["total"], d["high"], d["avg_score"], d["rate"], d["services"],
-        d["fig_timeline"], d["fig_score"], d["fig_services"], d["health"],
+            # Statut Kafka
+            html.Div(
+                style={
+                    "margin": "0 14px 16px",
+                    "padding": "13px 14px",
+                    "background": (
+                        "linear-gradient("
+                        "145deg,"
+                        "rgba(255,255,255,.055),"
+                        "rgba(255,255,255,.025)"
+                        ")"
+                    ),
+                    "border": (
+                        "1px solid rgba(148,163,184,.12)"
+                    ),
+                    "borderRadius": "15px",
+                },
+                children=[
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "gap": "8px",
+                            "marginBottom": "7px",
+                        },
+                        children=[
+                            html.Span(
+                                className="pulse",
+                                style={
+                                    "width": "8px",
+                                    "height": "8px",
+                                    "borderRadius": "50%",
+                                    "background": GREEN,
+                                    "display": "inline-block",
+                                    "flexShrink": "0",
+                                },
+                            ),
+                            html.Span(
+                                "Kafka connecté",
+                                className="sidebar-text",
+                                style={
+                                    "fontSize": "11px",
+                                    "fontWeight": "800",
+                                    "color": "#b8c7df",
+                                },
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        KAFKA_TOPIC,
+                        className="sidebar-text",
+                        style={
+                            "fontSize": "9px",
+                            "color": "#60708d",
+                            "fontFamily": (
+                                "JetBrains Mono, monospace"
+                            ),
+                            "overflow": "hidden",
+                            "textOverflow": "ellipsis",
+                            "whiteSpace": "nowrap",
+                        },
+                    ),
+                    html.Div(
+                        (
+                            "Actualisation · "
+                            f"{REFRESH_INTERVAL_MS // 1000}s"
+                        ),
+                        className="sidebar-text",
+                        style={
+                            "fontSize": "9px",
+                            "color": "#60a5fa",
+                            "marginTop": "7px",
+                            "fontWeight": "700",
+                        },
+                    ),
+                ],
+            ),
+        ],
     )
-# @app.callback(
-#     Output("kpi-total",     "children"),
-#     Output("kpi-high",      "children"),
-#     Output("kpi-avg-score", "children"),
-#     Output("kpi-rate",      "children"),
-#     Output("kpi-services",  "children"),
-#     Output("graph-timeline","figure"),
-#     Output("graph-score",   "figure"),
-#     Output("graph-services","figure"),
-#     Output("health-panel",  "children"),
-#     Input("interval", "n_intervals"),
-# )
-# def refresh_dashboard(_):
-#     with _lock:
-#         rows  = list(_buffer)
-#         total = _total_received
 
-#     high_rows   = [r for r in rows if r.get("_ratio_val", 0) > 1.3]
-#     scores      = [r.get("_score_val", 0) for r in rows if "_score_val" in r]
-#     avg_score   = sum(scores) / len(scores) if scores else 0
-#     services    = len({r["Source"] for r in high_rows if r.get("Source")})
 
-#     # Anomalies per minute (last 5 min)
-#     now  = datetime.now()
-#     rate = sum(1 for r in rows if r.get("_ratio_val", 0) > 1.3 and _within_minutes(r, now, 1))
+# def _sidebar() -> html.Div:
+#     def nav_button(page_id: str, icon: str, label: str, subtitle: str) -> html.Button:
+#         return html.Button(
+#             id=f"nav-{page_id}",
+#             n_clicks=0,
+#             className="nav-item",
+#             style={
+#                 "width": "100%",
+#                 "border": "1px solid rgba(148,163,184,.08)",
+#                 "background": "rgba(255,255,255,.025)",
+#                 "color": "white",
+#                 "padding": "11px 12px",
+#                 "borderRadius": "14px",
+#                 "display": "flex",
+#                 "alignItems": "center",
+#                 "gap": "12px",
+#                 "textAlign": "left",
+#                 "cursor": "pointer",
+#                 "marginBottom": "7px",
+#             },
+#             children=[
+#                 html.Div(
+#                     icon,
+#                     style={
+#                         "width": "38px",
+#                         "height": "38px",
+#                         "minWidth": "38px",
+#                         "borderRadius": "12px",
+#                         "display": "grid",
+#                         "placeItems": "center",
+#                         "background": "linear-gradient(145deg,rgba(96,165,250,.18),rgba(139,92,246,.12))",
+#                         "fontSize": "16px",
+#                         "border": "1px solid rgba(148,163,184,.13)",
+#                     },
+#                 ),
+#                 html.Div(
+#                     className="sidebar-text",
+#                     children=[
+#                         html.Div(label, style={"fontWeight": "800", "fontSize": "13px"}),
+#                         html.Div(
+#                             subtitle,
+#                             style={
+#                                 "fontSize": "9px",
+#                                 "fontWeight": "500",
+#                                 "color": "#7f91b3",
+#                                 "marginTop": "3px",
+#                             },
+#                         ),
+#                     ],
+#                 ),
+#             ],
+#         )
 
-#     health = [
-#         _health_badge("Kafka Broker",      ok=True),
-#         _health_badge("Kubernetes Cluster",ok=True),
-#         _health_badge("ML Model API",      ok=total > 0),
-#         _health_badge("Spark Streaming",   ok=total > 0),
-#     ]
-
-#     display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-
-#     return (
-#         str(total),
-#         str(len(high_rows)),
-#         f"{avg_score:.3f}",
-#         f"{rate}/min",
-#         str(services),
-#         _anomaly_timeline_fig(display_rows),
-#         _score_timeline_fig(display_rows),
-#         _services_fig(rows),
-#         health,
+#     return html.Div(
+#         className="responsive-sidebar",
+#         style={
+#             "width": "262px",
+#             "minWidth": "262px",
+#             "height": "100vh",
+#             "position": "relative",
+#             "overflow": "hidden",
+#             "background": f"linear-gradient(180deg,{SIDE} 0%,{SIDE2} 58%,#0b1730 100%)",
+#             "display": "flex",
+#             "flexDirection": "column",
+#             "boxShadow": "10px 0 40px rgba(7,18,37,.22)",
+#             "zIndex": "10",
+#         },
+#         children=[
+#             html.Div(
+#                 style={
+#                     "position": "absolute",
+#                     "width": "180px",
+#                     "height": "180px",
+#                     "borderRadius": "50%",
+#                     "background": "rgba(37,99,235,.16)",
+#                     "filter": "blur(52px)",
+#                     "top": "-70px",
+#                     "right": "-70px",
+#                 }
+#             ),
+#             html.Div(
+#                 style={"padding": "24px 19px 18px", "position": "relative"},
+#                 children=[
+#                     html.Div(
+#                         style={"display": "flex", "alignItems": "center", "gap": "13px"},
+#                         children=[
+#                             html.Div(
+#                                 "◈",
+#                                 style={
+#                                     "width": "48px",
+#                                     "height": "48px",
+#                                     "minWidth": "48px",
+#                                     "borderRadius": "20px",
+#                                     "display": "grid",
+#                                     "placeItems": "center",
+#                                     "fontSize": "24px",
+#                                     "color": "white",
+#                                     "background": "linear-gradient(135deg,#60a5fa 0%,#2563eb 52%,#7c3aed 100%)",
+#                                     "boxShadow": "0 14px 34px rgba(37,99,235,.42)",
+#                                 },
+#                             ),
+#                             html.Div(
+#                                 className="sidebar-text",
+#                                 children=[
+#                                     html.Div(
+#                                         "LogGuardian",
+#                                         style={
+#                                             "fontSize": "18px",
+#                                             "fontWeight": "900",
+#                                             "color": "white",
+#                                             "letterSpacing": "-.035em",
+#                                         },
+#                                     ),
+#                                     html.Div(
+#                                         "AIOps Command Center",
+#                                         style={
+#                                             "fontSize": "9px",
+#                                             "fontWeight": "600",
+#                                             "color": "#7f91b3",
+#                                             "marginTop": "3px",
+#                                             "letterSpacing": ".05em",
+#                                             "textTransform": "uppercase",
+#                                         },
+#                                     ),
+#                                 ],
+#                             ),
+#                         ],
+#                     )
+#                 ],
+#             ),
+#             html.Div(
+#                 style={
+#                     "height": "1px",
+#                     "background": "linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent)",
+#                     "margin": "0 16px 17px",
+#                 }
+#             ),
+#             html.Div(
+#                 "Navigation",
+#                 className="sidebar-text",
+#                 style={
+#                     "fontSize": "9px",
+#                     "fontWeight": "800",
+#                     "color": "#42577d",
+#                     "letterSpacing": ".16em",
+#                     "padding": "0 20px 11px",
+#                     "textTransform": "uppercase",
+#                     "fontFamily": "JetBrains Mono, monospace",
+#                 },
+#             ),
+#             html.Div(
+#                 style={"padding": "0 12px", "flex": "1"},
+#                 children=[
+#                     nav_button("dashboard", "▦", "Vue cockpit", "KPIs · graphes · risque"),
+#                     nav_button("logs", "≡", "Flux logs", "Recherche · IA · feedback"),
+#                     nav_button("alerts", "⚠", "Incident board", "Anomalies critiques"),
+#                 ],
+#             ),
+#             html.Div(
+#                 style={
+#                     "margin": "0 14px 16px",
+#                     "padding": "13px 14px",
+#                     "background": "linear-gradient(145deg,rgba(255,255,255,.055),rgba(255,255,255,.025))",
+#                     "border": "1px solid rgba(148,163,184,.12)",
+#                     "borderRadius": "15px",
+#                 },
+#                 children=[
+#                     html.Div(
+#                         style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "7px"},
+#                         children=[
+#                             html.Span(
+#                                 className="pulse",
+#                                 style={
+#                                     "width": "8px",
+#                                     "height": "8px",
+#                                     "borderRadius": "50%",
+#                                     "background": GREEN,
+#                                     "display": "inline-block",
+#                                 },
+#                             ),
+#                             html.Span(
+#                                 "Kafka connecté",
+#                                 className="sidebar-text",
+#                                 style={"fontSize": "11px", "fontWeight": "800", "color": "#b8c7df"},
+#                             ),
+#                         ],
+#                     ),
+#                     html.Div(
+#                         KAFKA_TOPIC,
+#                         className="sidebar-text",
+#                         style={
+#                             "fontSize": "9px",
+#                             "color": "#60708d",
+#                             "fontFamily": "JetBrains Mono, monospace",
+#                             "overflow": "hidden",
+#                             "textOverflow": "ellipsis",
+#                             "whiteSpace": "nowrap",
+#                         },
+#                     ),
+#                     html.Div(
+#                         f"Actualisation · {REFRESH_INTERVAL_MS // 1000}s",
+#                         className="sidebar-text",
+#                         style={"fontSize": "9px", "color": "#60a5fa", "marginTop": "7px", "fontWeight": "700"},
+#                     ),
+#                 ],
+#             ),
+#         ],
 #     )
 
 
-def _within_minutes(row, now, minutes):
-    try:
-        ts = datetime.strptime(row["Timestamp"], "%Y-%m-%d %H:%M:%S")
-        return (now - ts).total_seconds() <= minutes * 60
-    except Exception:
-        return False
+
+def _metric_card(label: str, value_id: str, accent: str, icon: str, hint: str) -> html.Div:
+    return html.Div(
+        className="card-hover",
+        style={
+            "position": "relative",
+            "overflow": "hidden",
+            "background": f"linear-gradient(145deg,rgba(255,255,255,1),{accent}07 100%)",
+            "border": f"1.5px solid {BD}",
+            "borderRadius": "22px",
+            "padding": "20px 22px 22px",
+            "boxShadow": "0 8px 32px rgba(15,30,80,.08),inset 0 1px 0 rgba(255,255,255,.9)",
+            "minHeight": "138px",
+        },
+        children=[
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "110px",
+                    "height": "110px",
+                    "borderRadius": "50%",
+                    "right": "-42px",
+                    "top": "-42px",
+                    "background": f"radial-gradient(circle,{accent}20,{accent}06 60%,transparent)",
+                }
+            ),
+            html.Div(
+                style={
+                    "display": "flex",
+                    "justifyContent": "space-between",
+                    "alignItems": "center",
+                    "marginBottom": "16px",
+                    "position": "relative",
+                },
+                children=[
+                    html.Div(
+                        icon,
+                        style={
+                            "width": "42px",
+                            "height": "42px",
+                            "display": "grid",
+                            "placeItems": "center",
+                            "borderRadius": "14px",
+                            "fontSize": "20px",
+                            "background": f"linear-gradient(135deg,{accent}1e,{accent}0e)",
+                            "border": f"1.5px solid {accent}2e",
+                            "boxShadow": f"0 8px 20px {accent}22",
+                        },
+                    ),
+                    html.Span(
+                        hint,
+                        style={
+                            "fontSize": "8px",
+                            "fontWeight": "900",
+                            "color": accent,
+                            "background": f"linear-gradient(135deg,{accent}14,{accent}0a)",
+                            "border": f"1.5px solid {accent}28",
+                            "borderRadius": "999px",
+                            "padding": "5px 9px",
+                            "fontFamily": "JetBrains Mono, monospace",
+                            "letterSpacing": ".09em",
+                        },
+                    ),
+                ],
+            ),
+            html.Div(
+                id=value_id,
+                children="0",
+                style={
+                    "fontSize": "34px",
+                    "fontWeight": "900",
+                    "color": TXT,
+                    "fontFamily": "JetBrains Mono, monospace",
+                    "letterSpacing": "-.05em",
+                    "lineHeight": "1",
+                    "marginBottom": "8px",
+                    "position": "relative",
+                },
+            ),
+            html.Div(
+                label,
+                style={
+                    "fontSize": "10px",
+                    "fontWeight": "800",
+                    "color": MUT,
+                    "textTransform": "uppercase",
+                    "letterSpacing": ".10em",
+                    "position": "relative",
+                },
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "left": "0",
+                    "bottom": "0",
+                    "width": "100%",
+                    "height": "4px",
+                    "background": f"linear-gradient(90deg,{accent},{accent}88 35%,{accent}22 65%,transparent)",
+                    "borderRadius": "0 0 22px 22px",
+                }
+            ),
+        ],
+    )
 
 
-# ── Alerts callbacks ──────────────────────────────────────────────────────────
+
+def _panel(title: str, children: Any) -> html.Div:
+    return html.Div(
+        className="card-hover",
+        style={
+            "background": "rgba(255,255,255,.95)",
+            "border": f"1.5px solid {BD}",
+            "borderRadius": "22px",
+            "overflow": "hidden",
+            "boxShadow": "0 10px 36px rgba(15,30,80,.075),inset 0 1px 0 rgba(255,255,255,.9)",
+            "backdropFilter": "blur(12px)",
+            "WebkitBackdropFilter": "blur(12px)",
+        },
+        children=[
+            html.Div(
+                style={
+                    "padding": "14px 18px",
+                    "borderBottom": f"1px solid {BD2}",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "gap": "10px",
+                    "background": "linear-gradient(180deg,rgba(255,255,255,1),rgba(248,251,255,.7))",
+                },
+                children=[
+                    html.Span(
+                        style={
+                            "width": "8px",
+                            "height": "8px",
+                            "flexShrink": "0",
+                            "borderRadius": "50%",
+                            "background": "linear-gradient(135deg,#60a5fa,#a78bfa)",
+                            "boxShadow": "0 0 0 3px rgba(96,165,250,.16),0 0 0 6px rgba(96,165,250,.06)",
+                        }
+                    ),
+                    html.Span(
+                        title,
+                        style={
+                            "fontSize": "10px",
+                            "fontWeight": "900",
+                            "color": MUT,
+                            "textTransform": "uppercase",
+                            "letterSpacing": ".11em",
+                            "fontFamily": "JetBrains Mono, monospace",
+                        },
+                    ),
+                ],
+            ),
+            html.Div(style={"padding": "16px"}, children=children),
+        ],
+    )
+
+
+def _empty_fig(text: str = "En attente de données", height: int = 260) -> go.Figure:
+    figure = go.Figure()
+    figure.update_layout(
+        height=height,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        margin=dict(l=20, r=20, t=20, b=20),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        annotations=[
+            dict(
+                text=text,
+                x=.5,
+                y=.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(color=MUT2, size=13),
+            )
+        ],
+    )
+    return figure
+
+
+
+def _plot_layout(height: int = 260) -> dict[str, Any]:
+    return {
+        "height": height,
+        "paper_bgcolor": "rgba(0,0,0,0)",
+        "plot_bgcolor": "rgba(0,0,0,0)",
+        "margin": dict(l=42, r=18, t=22, b=38),
+        "font": dict(family="Inter", color=MUT, size=10),
+        "xaxis": dict(gridcolor="#eef3f8", zeroline=False, linecolor="#e7edf5"),
+        "yaxis": dict(gridcolor="#eef3f8", zeroline=False, linecolor="#e7edf5"),
+        "legend": dict(orientation="h", y=1.10, x=0, bgcolor="rgba(0,0,0,0)"),
+        "hoverlabel": dict(bgcolor="white", bordercolor=BD, font=dict(color=TXT, family="Inter")),
+    }
+
+
+def _stream_fig(rows: list[dict[str, Any]]) -> go.Figure:
+    if not rows:
+        return _empty_fig()
+
+    recent = list(reversed(rows[:80]))
+    indexes = list(range(len(recent)))
+    normal = [1 if row["Statut"] == "NORMAL" else 0 for row in recent]
+    anomaly = [1 if row["Statut"] == "ANOMALIE" else 0 for row in recent]
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Bar(
+            x=indexes,
+            y=normal,
+            name="Normal",
+            marker_color="#34d399",
+        )
+    )
+    figure.add_trace(
+        go.Bar(
+            x=indexes,
+            y=anomaly,
+            name="Anomalie",
+            marker_color="#f87171",
+        )
+    )
+    figure.update_layout(**_plot_layout(280), barmode="stack")
+    return figure
+
+
+def _score_fig(rows: list[dict[str, Any]]) -> go.Figure:
+    if not rows:
+        return _empty_fig()
+
+    recent = list(reversed(rows[:80]))
+    values = [row.get("_score_val", 0.0) for row in recent]
+
+    figure = go.Figure(
+        go.Scatter(
+            x=list(range(len(values))),
+            y=values,
+            mode="lines",
+            name="Score IA",
+            line=dict(color=PURP, width=2.5),
+            fill="tozeroy",
+            fillcolor="rgba(124,58,237,.08)",
+        )
+    )
+    figure.add_hline(
+        y=ALERT_THRESHOLD,
+        line_dash="dot",
+        line_color=RED,
+        annotation_text=f"seuil {ALERT_THRESHOLD}",
+    )
+    figure.update_layout(**_plot_layout(240))
+    return figure
+
+
+def _services_fig(rows: list[dict[str, Any]]) -> go.Figure:
+    if not rows:
+        return _empty_fig()
+
+    counts = Counter(
+        row.get("Source", "unknown")
+        for row in rows
+        if row.get("Statut") == "ANOMALIE"
+    )
+
+    if not counts:
+        return _empty_fig("Aucune anomalie")
+
+    top = counts.most_common(8)
+    figure = go.Figure(
+        go.Bar(
+            x=[value for _, value in top],
+            y=[name for name, _ in top],
+            orientation="h",
+            marker_color=CYAN,
+        )
+    )
+    layout = _plot_layout(240)
+    layout["margin"] = dict(l=100, r=18, t=20, b=36)
+    figure.update_layout(**layout)
+    return figure
+
+
+def _risk_fig(rows: list[dict[str, Any]]) -> go.Figure:
+    if not rows:
+        value = 0.0
+    else:
+        anomalies = sum(1 for row in rows if row["Statut"] == "ANOMALIE")
+        value = round(anomalies / len(rows) * 100, 1)
+
+    color = GREEN if value < 35 else ORAN if value < 70 else RED
+    figure = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=value,
+            number={"suffix": "%", "font": {"color": color, "size": 38}},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": color},
+                "steps": [
+                    {"range": [0, 35], "color": "#f0fdf4"},
+                    {"range": [35, 70], "color": "#fff7ed"},
+                    {"range": [70, 100], "color": "#fef2f2"},
+                ],
+            },
+        )
+    )
+    figure.update_layout(
+        height=260,
+        margin=dict(l=20, r=20, t=20, b=20),
+        paper_bgcolor="white",
+    )
+    return figure
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE COCKPIT
+# ─────────────────────────────────────────────────────────────────────────────
+def _dashboard_page() -> html.Div:
+    return html.Div(
+        id="page-dashboard",
+        className="page-enter",
+        style={"display": "none", "height": "100%", "overflow": "auto"},
+        children=[
+            _topbar(
+                "Cockpit observabilité",
+                "Vue temps réel — anomalies, risque et santé des services",
+                "clock-dashboard",
+            ),
+            html.Div(
+                style={"padding": "22px", "display": "grid", "gap": "18px"},
+                children=[
+                    html.Div(
+                        style={
+                            "display": "grid",
+                            "gridTemplateColumns": "repeat(5, minmax(0, 1fr))",
+                            "gap": "14px",
+                        },
+                        children=[
+                            _metric_card("logs reçus", "m-total", BLUE, "📥", "STREAM"),
+                            _metric_card("anomalies", "m-anom", RED, "🔥", "ML"),
+                            _metric_card("score moyen", "m-score", PURP, "🧠", "MODEL"),
+                            _metric_card("sources touchées", "m-sources", CYAN, "🖥", "SVC"),
+                            _metric_card("risk level", "m-risk", ORAN, "⚡", "AIOPS"),
+                        ],
+                    ),
+                    html.Div(
+                        style={
+                            "display": "grid",
+                            "gridTemplateColumns": "1.4fr .6fr",
+                            "gap": "18px",
+                        },
+                        children=[
+                            _panel(
+                                "Flux anomalies / normal",
+                                dcc.Graph(
+                                    id="fig-stream",
+                                    config={"displayModeBar": False},
+                                ),
+                            ),
+                            _panel(
+                                "Jauge risque global",
+                                dcc.Graph(
+                                    id="fig-risk",
+                                    config={"displayModeBar": False},
+                                ),
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        style={
+                            "display": "grid",
+                            "gridTemplateColumns": "1fr 1fr 1fr",
+                            "gap": "18px",
+                        },
+                        children=[
+                            _panel(
+                                "Top services impactés",
+                                dcc.Graph(
+                                    id="fig-services",
+                                    config={"displayModeBar": False},
+                                ),
+                            ),
+                            _panel(
+                                "Score IA — derniers événements",
+                                dcc.Graph(
+                                    id="fig-score",
+                                    config={"displayModeBar": False},
+                                ),
+                            ),
+                            _panel(
+                                "Briefing analyste IA",
+                                html.Div(id="ai-briefing"),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE LOGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _filter_bar() -> html.Div:
+    input_style = {
+        "height": "44px",
+        "width": "100%",
+        "border": f"1px solid {BD}",
+        "borderRadius": "12px",
+        "padding": "0 14px 0 39px",
+        "fontSize": "12px",
+        "fontWeight": "500",
+        "background": "rgba(255,255,255,.96)",
+        "color": TXT,
+        "outline": "none",
+        "boxShadow": "0 4px 12px rgba(15,23,42,.035)",
+    }
+    return html.Div(
+        style={
+            "display": "grid",
+            "gridTemplateColumns": "minmax(210px,1fr) 125px 140px 95px",
+            "gap": "9px",
+            "alignItems": "center",
+            "minWidth": "0",
+        },
+        children=[
+            html.Div(
+                style={"position": "relative", "minWidth": "0"},
+                children=[
+                    html.Span(
+                        "⌕",
+                        style={
+                            "position": "absolute",
+                            "left": "14px",
+                            "top": "50%",
+                            "transform": "translateY(-50%)",
+                            "fontSize": "18px",
+                            "color": MUT2,
+                            "zIndex": "2",
+                            "pointerEvents": "none",
+                        },
+                    ),
+                    dcc.Input(
+                        id="search-text",
+                        type="text",
+                        debounce=False,
+                        placeholder="Rechercher dans les logs…",
+                        style=input_style,
+                    ),
+                ],
+            ),
+            dcc.Dropdown(id="source-filter", placeholder="Source", clearable=True, className="dash-dropdown"),
+            dcc.Dropdown(
+                id="level-filter",
+                value="all",
+                clearable=False,
+                className="dash-dropdown",
+                options=[
+                    {"label": "Tous les statuts", "value": "all"},
+                    {"label": "Anomalies", "value": "high"},
+                    {"label": "Normaux", "value": "normal"},
+                ],
+            ),
+            dcc.Dropdown(
+                id="limit-filter",
+                value=200,
+                clearable=False,
+                className="dash-dropdown",
+                options=[
+                    {"label": "200", "value": 200},
+                    {"label": "500", "value": 500},
+                    {"label": "1 000", "value": 1000},
+                    {"label": "Max", "value": MAX_ROWS},
+                ],
+            ),
+        ],
+    )
+
+
+
+def _analyze_button_style(disabled: bool, generated: bool = False) -> dict[str, Any]:
+    if generated and not disabled:
+        border = "#86efac"
+        background = "linear-gradient(180deg,#ecfdf5,#dcfce7)"
+        color = "#047857"
+        shadow = "0 8px 18px rgba(16,185,129,.14)"
+    else:
+        border = "#c4b5fd" if not disabled else BD
+        background = "linear-gradient(135deg,#7c3aed,#2563eb)" if not disabled else "#f1f5f9"
+        color = "white" if not disabled else MUT2
+        shadow = "0 10px 24px rgba(99,102,241,.22)" if not disabled else "none"
+    return {
+        "height": "44px",
+        "padding": "0 16px",
+        "borderRadius": "12px",
+        "border": f"1px solid {border}",
+        "background": background,
+        "color": color,
+        "fontSize": "11px",
+        "fontWeight": "900",
+        "cursor": "pointer" if not disabled else "not-allowed",
+        "whiteSpace": "nowrap",
+        "opacity": "1" if not disabled else ".72",
+        "boxShadow": shadow,
+    }
+
+
+
+def _feedback_button_style(
+    kind: str,
+    disabled: bool = False,
+    accepted: bool = False,
+) -> dict[str, Any]:
+    """Style cohérent des boutons de feedback selon leur état."""
+    is_positive = kind == "positive"
+
+    if accepted:
+        if is_positive:
+            return {
+                "height": "42px",
+                "borderRadius": "12px",
+                "cursor": "not-allowed",
+                "border": "1px solid rgba(52,211,153,.55)",
+                "background": "linear-gradient(180deg,rgba(52,211,153,.28),rgba(16,185,129,.18))",
+                "color": "#bbf7d0",
+                "fontWeight": "900",
+                "fontSize": "11px",
+                "opacity": "1",
+                "boxShadow": "0 8px 18px rgba(16,185,129,.14)",
+            }
+
+        return {
+            "height": "42px",
+            "borderRadius": "12px",
+            "cursor": "not-allowed",
+            "border": "1px solid rgba(148,163,184,.16)",
+            "background": "rgba(148,163,184,.08)",
+            "color": "#64748b",
+            "fontWeight": "900",
+            "fontSize": "11px",
+            "opacity": ".62",
+            "boxShadow": "none",
+        }
+
+    if disabled:
+        return {
+            "height": "42px",
+            "borderRadius": "12px",
+            "cursor": "not-allowed",
+            "border": "1px solid rgba(148,163,184,.14)",
+            "background": "rgba(148,163,184,.06)",
+            "color": "#64748b",
+            "fontWeight": "900",
+            "fontSize": "11px",
+            "opacity": ".58",
+            "boxShadow": "none",
+        }
+
+    if is_positive:
+        return {
+            "height": "42px",
+            "borderRadius": "12px",
+            "cursor": "pointer",
+            "border": "1px solid rgba(52,211,153,.38)",
+            "background": "linear-gradient(180deg,rgba(52,211,153,.14),rgba(16,185,129,.08))",
+            "color": "#86efac",
+            "fontWeight": "900",
+            "fontSize": "11px",
+            "opacity": "1",
+            "boxShadow": "none",
+        }
+
+    return {
+        "height": "42px",
+        "borderRadius": "12px",
+        "cursor": "pointer",
+        "border": "1px solid rgba(248,113,113,.42)",
+        "background": "linear-gradient(180deg,rgba(248,113,113,.13),rgba(239,68,68,.08))",
+        "color": "#fecaca",
+        "fontWeight": "900",
+        "fontSize": "11px",
+        "opacity": "1",
+        "boxShadow": "none",
+    }
+
+
+def _rag_block(title: str, component_id: str, accent: str, initial_text: str) -> html.Div:
+    return html.Div(
+        style={"marginBottom": "14px"},
+        children=[
+            html.Div(
+                style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "gap": "8px",
+                    "marginBottom": "8px",
+                },
+                children=[
+                    html.Span(
+                        style={
+                            "width": "7px",
+                            "height": "7px",
+                            "borderRadius": "50%",
+                            "background": f"linear-gradient(135deg,{accent},{accent}aa)",
+                            "boxShadow": f"0 0 0 3px {accent}22,0 0 0 6px {accent}0c",
+                            "flexShrink": "0",
+                        }
+                    ),
+                    html.Div(
+                        title,
+                        style={
+                            "fontSize": "9px",
+                            "fontWeight": "900",
+                            "color": "#8da4c8",
+                            "textTransform": "uppercase",
+                            "letterSpacing": ".13em",
+                            "fontFamily": "JetBrains Mono, monospace",
+                        },
+                    ),
+                ],
+            ),
+            html.Div(
+                id=component_id,
+                children=initial_text,
+                style={
+                    "background": f"linear-gradient(145deg,rgba(255,255,255,.08),rgba(255,255,255,.04))",
+                    "border": "1px solid rgba(148,163,184,.16)",
+                    "borderLeft": f"3px solid {accent}",
+                    "borderRadius": "16px",
+                    "padding": "13px 14px",
+                    "fontSize": "12px",
+                    "fontWeight": "500",
+                    "lineHeight": "1.68",
+                    "color": "#d8e4f5",
+                    "whiteSpace": "normal",
+                    "overflowWrap": "anywhere",
+                    "boxShadow": f"inset 0 1px 0 rgba(255,255,255,.05),0 2px 8px rgba(0,0,0,.08)",
+                },
+            ),
+        ],
+    )
+
+
+
+def _rag_side_panel() -> html.Div:
+    return html.Div(
+        className="rag-panel-enter",
+        style={
+            "height": "100%",
+            "minHeight": "0",
+            "position": "relative",
+            "overflowY": "auto",
+            "overflowX": "hidden",
+            "background": (
+                "radial-gradient(ellipse 60% 40% at 90% -5%,rgba(139,92,246,.28),transparent),"
+                "radial-gradient(ellipse 50% 40% at -5% 60%,rgba(14,165,233,.16),transparent),"
+                "radial-gradient(ellipse 40% 30% at 40% 105%,rgba(37,99,235,.14),transparent),"
+                "linear-gradient(170deg,#060f22 0%,#0b1830 55%,#0e1c35 100%)"
+            ),
+            "border": "1.5px solid rgba(148,163,184,.14)",
+            "borderRadius": "22px",
+            "padding": "20px",
+            "color": "white",
+            "boxShadow": "0 28px 72px rgba(4,12,28,.42),inset 0 1px 0 rgba(255,255,255,.06)",
+        },
+        children=[
+            html.Div(
+                style={
+                    "display": "flex",
+                    "justifyContent": "space-between",
+                    "alignItems": "flex-start",
+                    "marginBottom": "18px",
+                },
+                children=[
+                    html.Div([
+                        html.Div(
+                            style={"display": "flex", "alignItems": "center", "gap": "11px"},
+                            children=[
+                                html.Div(
+                                    "✦",
+                                    style={
+                                        "width": "38px",
+                                        "height": "38px",
+                                        "display": "grid",
+                                        "placeItems": "center",
+                                        "borderRadius": "13px",
+                                        "fontSize": "17px",
+                                        "background": "linear-gradient(135deg,#a78bfa,#6366f1,#2563eb)",
+                                        "boxShadow": "0 12px 28px rgba(99,102,241,.38),inset 0 1px 0 rgba(255,255,255,.15)",
+                                    },
+                                ),
+                                html.Div(
+                                    "Analyste IA",
+                                    style={
+                                        "fontSize": "18px",
+                                        "fontWeight": "900",
+                                        "letterSpacing": "-.03em",
+                                        "background": "linear-gradient(135deg,#fff 0%,#c4b5fd 100%)",
+                                        "WebkitBackgroundClip": "text",
+                                        "WebkitTextFillColor": "transparent",
+                                        "backgroundClip": "text",
+                                    },
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            "Analyse contextualisée · recommandation · feedback",
+                            style={
+                                "fontSize": "9px",
+                                "fontWeight": "600",
+                                "color": "#7090b8",
+                                "marginTop": "8px",
+                                "letterSpacing": ".04em",
+                            },
+                        ),
+                    ]),
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                        children=[
+                            html.Div(id="rag-status-chip"),
+                            html.Button(
+                                "×",
+                                id="close-rag-btn",
+                                n_clicks=0,
+                                title="Fermer",
+                                style={
+                                    "width": "34px",
+                                    "height": "34px",
+                                    "borderRadius": "11px",
+                                    "border": "1px solid rgba(255,255,255,.16)",
+                                    "background": "rgba(255,255,255,.07)",
+                                    "color": "#94a3b8",
+                                    "fontSize": "20px",
+                                    "cursor": "pointer",
+                                    "lineHeight": "1",
+                                    "display": "grid",
+                                    "placeItems": "center",
+                                    "transition": "all .18s ease",
+                                },
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            html.Div(
+                style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px", "marginBottom": "16px"},
+                children=[
+                    html.Div(
+                        style={
+                            "background": "linear-gradient(145deg,rgba(139,92,246,.20),rgba(99,102,241,.08))",
+                            "border": "1.5px solid rgba(196,181,253,.22)",
+                            "borderRadius": "16px",
+                            "padding": "14px",
+                            "boxShadow": "inset 0 1px 0 rgba(255,255,255,.06)",
+                        },
+                        children=[
+                            html.Div(
+                                "Score IA",
+                                style={
+                                    "fontSize": "8px",
+                                    "color": "#8daad2",
+                                    "fontWeight": "900",
+                                    "textTransform": "uppercase",
+                                    "letterSpacing": ".12em",
+                                    "fontFamily": "JetBrains Mono, monospace",
+                                },
+                            ),
+                            html.Div(
+                                id="rag-score",
+                                children="—",
+                                style={
+                                    "fontSize": "28px",
+                                    "fontWeight": "900",
+                                    "fontFamily": "JetBrains Mono, monospace",
+                                    "color": "#c4b5fd",
+                                    "marginTop": "8px",
+                                    "letterSpacing": "-.03em",
+                                },
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        style={
+                            "background": "linear-gradient(145deg,rgba(249,115,22,.18),rgba(234,88,12,.08))",
+                            "border": "1.5px solid rgba(253,186,116,.22)",
+                            "borderRadius": "16px",
+                            "padding": "14px",
+                            "boxShadow": "inset 0 1px 0 rgba(255,255,255,.06)",
+                        },
+                        children=[
+                            html.Div(
+                                "Ratio",
+                                style={
+                                    "fontSize": "8px",
+                                    "color": "#8daad2",
+                                    "fontWeight": "900",
+                                    "textTransform": "uppercase",
+                                    "letterSpacing": ".12em",
+                                    "fontFamily": "JetBrains Mono, monospace",
+                                },
+                            ),
+                            html.Div(
+                                id="rag-ratio",
+                                children="—",
+                                style={
+                                    "fontSize": "28px",
+                                    "fontWeight": "900",
+                                    "fontFamily": "JetBrains Mono, monospace",
+                                    "color": "#fdba74",
+                                    "marginTop": "8px",
+                                    "letterSpacing": "-.03em",
+                                },
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            _rag_block("Log sélectionné", "rag-desc", "#38bdf8", "Sélectionnez un log."),
+            _rag_block("Analyse IA", "rag-analysis", "#a78bfa", "Cliquez sur « Analyser avec l’IA »."),
+            _rag_block("Action recommandée", "rag-action", "#34d399", "La recommandation apparaîtra après l’analyse."),
+            html.Div(
+                style={
+                    "paddingTop": "16px",
+                    "borderTop": "1px solid rgba(148,163,184,.14)",
+                    "marginTop": "4px",
+                },
+                children=[
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "justifyContent": "space-between",
+                            "marginBottom": "11px",
+                        },
+                        children=[
+                            html.Div(
+                                style={"display": "flex", "alignItems": "center", "gap": "7px"},
+                                children=[
+                                    html.Span(
+                                        style={
+                                            "width": "6px",
+                                            "height": "6px",
+                                            "borderRadius": "50%",
+                                            "background": "linear-gradient(135deg,#60a5fa,#a78bfa)",
+                                            "flexShrink": "0",
+                                        }
+                                    ),
+                                    html.Div(
+                                        "Feedback utilisateur",
+                                        style={
+                                            "fontSize": "9px",
+                                            "fontWeight": "900",
+                                            "color": "#8fa3c7",
+                                            "textTransform": "uppercase",
+                                            "letterSpacing": ".12em",
+                                            "fontFamily": "JetBrains Mono, monospace",
+                                        },
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                "améliore le modèle",
+                                style={
+                                    "fontSize": "8px",
+                                    "color": "#4a6080",
+                                    "fontWeight": "600",
+                                    "letterSpacing": ".04em",
+                                },
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "9px"},
+                        children=[
+                            html.Button(
+                                "👍 Utile",
+                                id="fb-up",
+                                n_clicks=0,
+                                disabled=True,
+                                style=_feedback_button_style(
+                                    "positive",
+                                    disabled=True,
+                                ),
+                            ),
+                            html.Button(
+                                "👎 Pas utile",
+                                id="fb-down",
+                                n_clicks=0,
+                                disabled=True,
+                                style=_feedback_button_style(
+                                    "negative",
+                                    disabled=True,
+                                ),
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        id="feedback-status",
+                        children="Aucune analyse lancée.",
+                        style={
+                            "fontSize": "10px",
+                            "fontWeight": "500",
+                            "color": "#7d98be",
+                            "marginTop": "10px",
+                            "lineHeight": "1.6",
+                            "padding": "10px 12px",
+                            "borderRadius": "12px",
+                            "background": "rgba(255,255,255,.04)",
+                            "border": "1px solid rgba(148,163,184,.10)",
+                            "boxShadow": "inset 0 1px 0 rgba(255,255,255,.05)",
+                        },
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+
+def _ticket_modal() -> html.Div:
+    _sec = {
+        "fontSize": "9px",
+        "fontWeight": "900",
+        "color": MUT,
+        "textTransform": "uppercase",
+        "letterSpacing": ".12em",
+        "fontFamily": "JetBrains Mono, monospace",
+        "marginBottom": "8px",
+    }
+    _ro_box = {
+        "background": "#f8faff",
+        "border": f"1px solid {BD}",
+        "borderRadius": "12px",
+        "padding": "11px 13px",
+        "fontSize": "12px",
+        "color": TXT,
+        "lineHeight": "1.65",
+        "maxHeight": "90px",
+        "overflowY": "auto",
+        "whiteSpace": "pre-wrap",
+        "wordBreak": "break-word",
+    }
+    return html.Div(
+        id="ticket-modal-overlay",
+        style={
+            "display": "none",
+            "position": "fixed",
+            "top": "0",
+            "left": "0",
+            "right": "0",
+            "bottom": "0",
+            "zIndex": "9999",
+            "alignItems": "center",
+            "justifyContent": "center",
+            "background": "rgba(5,10,25,.78)",
+            "backdropFilter": "blur(12px)",
+            "WebkitBackdropFilter": "blur(12px)",
+        },
+        children=[
+            html.Div(
+                style={
+                    "width": "100%",
+                    "maxWidth": "600px",
+                    "maxHeight": "90vh",
+                    "overflowY": "auto",
+                    "margin": "0 20px",
+                    "background": "rgba(255,255,255,.99)",
+                    "border": f"1.5px solid {BD}",
+                    "borderRadius": "24px",
+                    "boxShadow": (
+                        "0 48px 100px rgba(0,0,0,.55),"
+                        "inset 0 1px 0 rgba(255,255,255,.9)"
+                    ),
+                    "padding": "28px 28px 24px",
+                    "position": "relative",
+                },
+                children=[
+                    # ── Header ──────────────────────────────────────
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "justifyContent": "space-between",
+                            "alignItems": "flex-start",
+                            "marginBottom": "18px",
+                        },
+                        children=[
+                            html.Div([
+                                html.Div(
+                                    "🎫 Ticket de support",
+                                    style={
+                                        "fontSize": "18px",
+                                        "fontWeight": "900",
+                                        "color": TXT,
+                                        "letterSpacing": "-.025em",
+                                    },
+                                ),
+                                html.Div(
+                                    "5 analyses rejetées — demande de vérification manuelle",
+                                    style={
+                                        "fontSize": "11px",
+                                        "color": MUT,
+                                        "marginTop": "5px",
+                                        "fontWeight": "500",
+                                    },
+                                ),
+                            ]),
+                            html.Button(
+                                "×",
+                                id="ticket-close-btn",
+                                n_clicks=0,
+                                style={
+                                    "width": "32px",
+                                    "height": "32px",
+                                    "borderRadius": "10px",
+                                    "border": f"1px solid {BD}",
+                                    "background": PAPER,
+                                    "color": MUT,
+                                    "fontSize": "20px",
+                                    "lineHeight": "1",
+                                    "cursor": "pointer",
+                                    "display": "grid",
+                                    "placeItems": "center",
+                                    "flexShrink": "0",
+                                },
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        style={
+                            "height": "1px",
+                            "background": BD2,
+                            "marginBottom": "20px",
+                        }
+                    ),
+                    # ── Log info ─────────────────────────────────────
+                    html.Div("Log concerné", style=_sec),
+                    html.Div(
+                        id="ticket-log-info",
+                        style={
+                            "display": "grid",
+                            "gridTemplateColumns": "repeat(3, 1fr)",
+                            "gap": "8px",
+                            "marginBottom": "16px",
+                        },
+                    ),
+                    # ── Last analysis ────────────────────────────────
+                    html.Div("Dernière analyse rejetée", style=_sec),
+                    html.Div(
+                        id="ticket-last-analysis",
+                        style={
+                            **_ro_box,
+                            "borderLeft": f"3px solid {PURP}",
+                            "marginBottom": "12px",
+                        },
+                    ),
+                    # ── Last action ──────────────────────────────────
+                    html.Div("Dernière recommandation rejetée", style=_sec),
+                    html.Div(
+                        id="ticket-last-action",
+                        style={
+                            **_ro_box,
+                            "borderLeft": f"3px solid {GREEN}",
+                            "marginBottom": "16px",
+                        },
+                    ),
+                    # ── User message ─────────────────────────────────
+                    html.Div("Votre commentaire (optionnel)", style=_sec),
+                    dcc.Textarea(
+                        id="ticket-user-message",
+                        placeholder=(
+                            "Décrivez le comportement attendu, "
+                            "le contexte ou toute information utile à l'équipe support…"
+                        ),
+                        style={
+                            "width": "100%",
+                            "height": "88px",
+                            "borderRadius": "12px",
+                            "border": f"1.5px solid {BD}",
+                            "padding": "10px 13px",
+                            "fontSize": "12px",
+                            "color": TXT,
+                            "background": "rgba(248,250,255,.85)",
+                            "outline": "none",
+                            "resize": "vertical",
+                            "fontFamily": "inherit",
+                            "lineHeight": "1.6",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.035)",
+                        },
+                    ),
+                    # ── Status ───────────────────────────────────────
+                    html.Div(
+                        id="ticket-send-status",
+                        style={
+                            "fontSize": "11px",
+                            "fontWeight": "600",
+                            "color": MUT,
+                            "marginTop": "10px",
+                            "minHeight": "18px",
+                        },
+                    ),
+                    # ── Footer buttons ───────────────────────────────
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "justifyContent": "flex-end",
+                            "gap": "10px",
+                            "marginTop": "20px",
+                            "paddingTop": "16px",
+                            "borderTop": f"1px solid {BD2}",
+                        },
+                        children=[
+                            html.Button(
+                                "Annuler",
+                                id="ticket-cancel-btn",
+                                n_clicks=0,
+                                style={
+                                    "height": "42px",
+                                    "padding": "0 22px",
+                                    "borderRadius": "12px",
+                                    "border": f"1px solid {BD}",
+                                    "background": PAPER,
+                                    "color": MUT,
+                                    "fontSize": "12px",
+                                    "fontWeight": "700",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                            html.Button(
+                                "📨 Envoyer le ticket",
+                                id="ticket-send-btn",
+                                n_clicks=0,
+                                style={
+                                    "height": "42px",
+                                    "padding": "0 22px",
+                                    "borderRadius": "12px",
+                                    "border": "none",
+                                    "background": (
+                                        f"linear-gradient(135deg,{PURP},{BLUE})"
+                                    ),
+                                    "color": "white",
+                                    "fontSize": "12px",
+                                    "fontWeight": "900",
+                                    "cursor": "pointer",
+                                    "boxShadow": (
+                                        "0 8px 22px rgba(139,92,246,.32)"
+                                    ),
+                                    "letterSpacing": ".01em",
+                                },
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+
+def _logs_workspace_style(opened: bool) -> dict[str, Any]:
+    return {
+        "height": "calc(100% - 76px)",
+        "display": "grid",
+        "gridTemplateColumns": "minmax(0,1fr) minmax(390px,430px)" if opened else "minmax(0,1fr)",
+        "gap": "14px" if opened else "0",
+        "padding": "16px",
+        "overflow": "hidden",
+        "background": "transparent",
+        "transition": "grid-template-columns .22s ease, gap .22s ease",
+    }
+
+
+
+def _rag_wrapper_style(opened: bool) -> dict[str, Any]:
+    return {
+        "display": "block" if opened else "none",
+        "height": "100%",
+        "minHeight": "0",
+        "minWidth": "0",
+        "overflow": "hidden",
+        "filter": "drop-shadow(0 16px 28px rgba(15,23,42,.12))",
+    }
+
+
+def _logs_page() -> html.Div:
+    return html.Div(
+        id="page-logs",
+        className="page-enter",
+        style={"display": "block", "height": "100%", "overflow": "hidden"},
+        children=[
+            _topbar(
+                "Flux logs augmenté",
+                "Table temps réel · analyse IA · recommandation · feedback",
+                "clock-logs",
+            ),
+            html.Div(
+                id="logs-workspace",
+                style=_logs_workspace_style(False),
+                children=[
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "flexDirection": "column",
+                            "height": "100%",
+                            "minWidth": "0",
+                            "minHeight": "0",
+                            "overflow": "hidden",
+                            "background": PAPER,
+                            "border": f"1px solid {BD}",
+                            "borderRadius": "15px",
+                        },
+                        children=[
+                            html.Div(
+                                style={
+                                    "minHeight": "76px",
+                                    "padding": "14px 15px",
+                                    "display": "grid",
+                                    "gridTemplateColumns": "minmax(0,1fr) 92px 178px",
+                                    "gap": "10px",
+                                    "alignItems": "center",
+                                    "borderBottom": f"1px solid {BD2}",
+                                    "background": "#fafcff",
+                                    "overflow": "hidden",
+                                },
+                                children=[
+                                    _filter_bar(),
+                                    html.Div(
+                                        id="logs-count",
+                                        style={
+                                            "fontSize": "10px",
+                                            "fontWeight": "800",
+                                            "color": MUT2,
+                                            "whiteSpace": "nowrap",
+                                            "textAlign": "center",
+                                            "fontFamily": (
+                                                "JetBrains Mono, monospace"
+                                            ),
+                                        },
+                                    ),
+                                    html.Button(
+                                        "✨ Analyser avec l’IA",
+                                        id="show-rag-btn",
+                                        n_clicks=0,
+                                        disabled=True,
+                                        style=_analyze_button_style(True),
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                style={
+                                    "flex": "1",
+                                    "minHeight": "0",
+                                    "minWidth": "0",
+                                    "overflow": "hidden",
+                                },
+                                children=[
+                                    dash_table.DataTable(
+                                        id="main-table",
+                                        columns=[
+                                            {"name": column, "id": column}
+                                            for column in TABLE_COLS
+                                        ],
+                                        data=[],
+                                        cell_selectable=True,
+                                        active_cell=None,
+                                        sort_action="native",
+                                        page_action="native",
+                                        page_size=22,
+                                        fixed_rows={"headers": True},
+                                        style_table={
+                                            "height": "100%",
+                                            "width": "100%",
+                                            "maxWidth": "100%",
+                                            "overflowX": "auto",
+                                            "overflowY": "auto",
+                                        },
+                                        style_header={
+                                            "backgroundColor": "#f0f4fa",
+                                            "fontWeight": "800",
+                                            "fontSize": "9px",
+                                            "color": MUT,
+                                            "border": "none",
+                                            "borderBottom": f"2px solid {BD}",
+                                            "padding": "10px 10px",
+                                            "textTransform": "uppercase",
+                                            "letterSpacing": ".06em",
+                                            "fontFamily": (
+                                                "JetBrains Mono, monospace"
+                                            ),
+                                        },
+                                        style_cell={
+                                            "backgroundColor": PAPER,
+                                            "fontSize": "11px",
+                                            "color": TXT,
+                                            "border": "none",
+                                            "borderBottom": f"1px solid {BD2}",
+                                            "padding": "9px 10px",
+                                            "whiteSpace": "nowrap",
+                                            "overflow": "hidden",
+                                            "textOverflow": "ellipsis",
+                                            "maxWidth": "0",
+                                        },
+                                        style_cell_conditional=[
+                                            {
+                                                "if": {"column_id": "Timestamp"},
+                                                "width": "145px",
+                                                "minWidth": "145px",
+                                                "maxWidth": "145px",
+                                                "fontFamily": (
+                                                    "JetBrains Mono, monospace"
+                                                ),
+                                                "color": MUT,
+                                            },
+                                            {
+                                                "if": {"column_id": "Source"},
+                                                "width": "85px",
+                                                "minWidth": "85px",
+                                                "maxWidth": "85px",
+                                                "color": BLUE,
+                                                "fontWeight": "800",
+                                            },
+                                            {
+                                                "if": {"column_id": "Host"},
+                                                "width": "85px",
+                                                "minWidth": "85px",
+                                                "maxWidth": "85px",
+                                                "color": MUT,
+                                            },
+                                            {
+                                                "if": {"column_id": "Message"},
+                                                "width": "330px",
+                                                "minWidth": "330px",
+                                                "maxWidth": "520px",
+                                                "whiteSpace": "normal",
+                                                "lineHeight": "1.45",
+                                            },
+                                            {
+                                                "if": {"column_id": "Score IA"},
+                                                "width": "75px",
+                                                "minWidth": "75px",
+                                                "maxWidth": "75px",
+                                                "fontFamily": (
+                                                    "JetBrains Mono, monospace"
+                                                ),
+                                                "fontWeight": "800",
+                                                "textAlign": "right",
+                                            },
+                                            {
+                                                "if": {"column_id": "Ratio"},
+                                                "width": "70px",
+                                                "minWidth": "70px",
+                                                "maxWidth": "70px",
+                                                "fontFamily": (
+                                                    "JetBrains Mono, monospace"
+                                                ),
+                                                "fontWeight": "800",
+                                                "textAlign": "center",
+                                            },
+                                            {
+                                                "if": {"column_id": "Statut"},
+                                                "width": "90px",
+                                                "minWidth": "90px",
+                                                "maxWidth": "90px",
+                                                "fontWeight": "900",
+                                                "textAlign": "center",
+                                                "fontSize": "10px",
+                                            },
+                                        ],
+                                        style_data_conditional=[
+                                            {
+                                                "if": {"row_index": "odd"},
+                                                "backgroundColor": "#f8faff",
+                                            },
+                                            {
+                                                "if": {
+                                                    "filter_query": (
+                                                        '{Statut} = "ANOMALIE"'
+                                                    ),
+                                                    "column_id": "Statut",
+                                                },
+                                                "color": RED,
+                                            },
+                                            {
+                                                "if": {
+                                                    "filter_query": (
+                                                        '{Statut} = "NORMAL"'
+                                                    ),
+                                                    "column_id": "Statut",
+                                                },
+                                                "color": GREEN,
+                                            },
+                                            {
+                                                "if": {
+                                                    "filter_query": (
+                                                        '{Statut} = "ANOMALIE"'
+                                                    ),
+                                                    "column_id": "Score IA",
+                                                },
+                                                "color": RED,
+                                            },
+                                            {
+                                                "if": {
+                                                    "filter_query": (
+                                                        '{Statut} = "ANOMALIE"'
+                                                    ),
+                                                    "column_id": "Ratio",
+                                                },
+                                                "color": ORAN,
+                                            },
+                                            {
+                                                "if": {"state": "selected"},
+                                                "backgroundColor": "#dbeafe",
+                                                "border": f"1px solid {BLUE}",
+                                            },
+                                        ],
+                                    )
+                                ],
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        id="rag-panel-wrapper",
+                        style=_rag_wrapper_style(False),
+                        children=[_rag_side_panel()],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE INCIDENTS
+# ─────────────────────────────────────────────────────────────────────────────
+def _alerts_page() -> html.Div:
+    return html.Div(
+        id="page-alerts",
+        className="page-enter",
+        style={"display": "none", "height": "100%", "overflow": "auto"},
+        children=[
+            _topbar(
+                "Incident board",
+                "Historique des événements classés comme anomalies",
+                "clock-alerts",
+            ),
+            html.Div(
+                style={"padding": "22px", "display": "grid", "gap": "18px"},
+                children=[
+                    html.Div(id="alert-strip"),
+                    html.Div(
+                        style={
+                            "background": PAPER,
+                            "border": f"1.5px solid {BD}",
+                            "borderRadius": "22px",
+                            "overflow": "hidden",
+                            "boxShadow": "0 8px 32px rgba(15,30,80,.07),inset 0 1px 0 rgba(255,255,255,.9)",
+                        },
+                        children=[
+                            dash_table.DataTable(
+                                id="alert-table",
+                                columns=[
+                                    {"name": column, "id": column}
+                                    for column in ALERT_COLS
+                                ],
+                                data=[],
+                                sort_action="native",
+                                page_action="native",
+                                page_size=30,
+                                style_table={"overflowX": "auto"},
+                                style_header={
+                                    "backgroundColor": "#fff1f2",
+                                    "fontWeight": "800",
+                                    "fontSize": "10px",
+                                    "color": RED,
+                                    "border": "none",
+                                    "padding": "11px 14px",
+                                    "textTransform": "uppercase",
+                                    "fontFamily": (
+                                        "JetBrains Mono, monospace"
+                                    ),
+                                },
+                                style_cell={
+                                    "backgroundColor": PAPER,
+                                    "fontSize": "12px",
+                                    "color": TXT,
+                                    "border": "none",
+                                    "borderBottom": f"1px solid {BD2}",
+                                    "padding": "10px 14px",
+                                },
+                                style_cell_conditional=[
+                                    {
+                                        "if": {"column_id": "Message"},
+                                        "minWidth": "480px",
+                                        "whiteSpace": "normal",
+                                    },
+                                    {
+                                        "if": {"column_id": "Ratio"},
+                                        "color": RED,
+                                        "fontWeight": "900",
+                                    },
+                                ],
+                            )
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+def _login_page() -> html.Div:
+    return html.Div(
+        style={
+            "minHeight": "100vh",
+            "display": "grid",
+            "placeItems": "center",
+            "padding": "24px",
+            "position": "relative",
+            "overflow": "hidden",
+            "background": (
+                "radial-gradient(ellipse 70% 50% at 15% 10%,rgba(37,99,235,.28),transparent),"
+                "radial-gradient(ellipse 65% 50% at 85% 15%,rgba(139,92,246,.26),transparent),"
+                "radial-gradient(ellipse 50% 40% at 50% 95%,rgba(14,165,233,.18),transparent),"
+                "linear-gradient(150deg,#050e1f 0%,#070f22 40%,#0a1530 100%)"
+            ),
+        },
+        children=[
+            # Décorations flottantes en arrière-plan
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "500px",
+                    "height": "500px",
+                    "borderRadius": "50%",
+                    "border": "1px solid rgba(96,165,250,.08)",
+                    "top": "50%",
+                    "left": "50%",
+                    "transform": "translate(-50%,-50%)",
+                    "pointerEvents": "none",
+                }
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "700px",
+                    "height": "700px",
+                    "borderRadius": "50%",
+                    "border": "1px solid rgba(96,165,250,.05)",
+                    "top": "50%",
+                    "left": "50%",
+                    "transform": "translate(-50%,-50%)",
+                    "pointerEvents": "none",
+                }
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "280px",
+                    "height": "280px",
+                    "borderRadius": "50%",
+                    "background": "radial-gradient(circle,rgba(139,92,246,.14),transparent 70%)",
+                    "filter": "blur(40px)",
+                    "top": "15%",
+                    "right": "12%",
+                    "pointerEvents": "none",
+                    "animation": "floatOrb 8s ease-in-out infinite",
+                }
+            ),
+            html.Div(
+                style={
+                    "position": "absolute",
+                    "width": "200px",
+                    "height": "200px",
+                    "borderRadius": "50%",
+                    "background": "radial-gradient(circle,rgba(37,99,235,.16),transparent 70%)",
+                    "filter": "blur(32px)",
+                    "bottom": "20%",
+                    "left": "14%",
+                    "pointerEvents": "none",
+                    "animation": "floatOrb 10s ease-in-out infinite reverse",
+                }
+            ),
+            # Carte de connexion
+            html.Div(
+                style={
+                    "position": "relative",
+                    "zIndex": "2",
+                    "width": "100%",
+                    "maxWidth": "420px",
+                    "padding": "40px 36px 36px",
+                    "borderRadius": "28px",
+                    "background": "rgba(255,255,255,.975)",
+                    "border": "1.5px solid rgba(255,255,255,.50)",
+                    "boxShadow": (
+                        "0 40px 100px rgba(0,0,0,.45),"
+                        "0 0 0 1px rgba(255,255,255,.12),"
+                        "inset 0 1px 0 rgba(255,255,255,.8)"
+                    ),
+                    "overflow": "hidden",
+                },
+                children=[
+                    # Orbe décoratif dans la carte
+                    html.Div(
+                        style={
+                            "position": "absolute",
+                            "width": "180px",
+                            "height": "180px",
+                            "borderRadius": "50%",
+                            "background": "radial-gradient(circle,rgba(37,99,235,.07),transparent 70%)",
+                            "top": "-60px",
+                            "right": "-60px",
+                            "pointerEvents": "none",
+                        }
+                    ),
+                    html.Div(
+                        style={
+                            "position": "absolute",
+                            "width": "120px",
+                            "height": "120px",
+                            "borderRadius": "50%",
+                            "background": "radial-gradient(circle,rgba(139,92,246,.06),transparent 70%)",
+                            "bottom": "-30px",
+                            "left": "-30px",
+                            "pointerEvents": "none",
+                        }
+                    ),
+                    # Logo
+                    html.Div(
+                        "◈",
+                        style={
+                            "width": "62px",
+                            "height": "62px",
+                            "display": "grid",
+                            "placeItems": "center",
+                            "margin": "0 auto 20px",
+                            "borderRadius": "20px",
+                            "fontSize": "28px",
+                            "color": "white",
+                            "background": "linear-gradient(135deg,#60a5fa 0%,#3b82f6 40%,#7c3aed 100%)",
+                            "boxShadow": (
+                                "0 18px 42px rgba(37,99,235,.40),"
+                                "inset 0 1px 0 rgba(255,255,255,.25)"
+                            ),
+                            "position": "relative",
+                        },
+                    ),
+                    html.H1(
+                        "LogGuardian",
+                        style={
+                            "margin": "0 0 6px",
+                            "textAlign": "center",
+                            "fontSize": "28px",
+                            "fontWeight": "900",
+                            "letterSpacing": "-.045em",
+                            "background": f"linear-gradient(135deg,{TXT} 0%,#1e3a8a 100%)",
+                            "WebkitBackgroundClip": "text",
+                            "WebkitTextFillColor": "transparent",
+                            "backgroundClip": "text",
+                        },
+                    ),
+                    html.P(
+                        "AIOps Command Center",
+                        style={
+                            "textAlign": "center",
+                            "color": MUT,
+                            "fontSize": "12px",
+                            "fontWeight": "600",
+                            "letterSpacing": ".08em",
+                            "textTransform": "uppercase",
+                            "marginBottom": "30px",
+                        },
+                    ),
+                    html.Label(
+                        "Identifiant",
+                        style={
+                            "display": "block",
+                            "fontSize": "11px",
+                            "fontWeight": "800",
+                            "color": MUT,
+                            "marginBottom": "7px",
+                            "letterSpacing": ".04em",
+                        },
+                    ),
+                    dcc.Input(
+                        id="login-username",
+                        type="text",
+                        placeholder="Votre identifiant",
+                        autoComplete="username",
+                        style={
+                            "width": "100%",
+                            "height": "48px",
+                            "padding": "0 16px",
+                            "borderRadius": "14px",
+                            "border": f"1.5px solid {BD}",
+                            "fontSize": "13px",
+                            "fontWeight": "500",
+                            "color": TXT,
+                            "background": "rgba(248,250,255,.85)",
+                            "outline": "none",
+                            "marginBottom": "16px",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.04),inset 0 1px 0 rgba(255,255,255,.9)",
+                            "transition": "border-color .2s,box-shadow .2s",
+                        },
+                    ),
+                    html.Label(
+                        "Mot de passe",
+                        style={
+                            "display": "block",
+                            "fontSize": "11px",
+                            "fontWeight": "800",
+                            "color": MUT,
+                            "marginBottom": "7px",
+                            "letterSpacing": ".04em",
+                        },
+                    ),
+                    dcc.Input(
+                        id="login-password",
+                        type="password",
+                        placeholder="••••••••",
+                        autoComplete="current-password",
+                        style={
+                            "width": "100%",
+                            "height": "48px",
+                            "padding": "0 16px",
+                            "borderRadius": "14px",
+                            "border": f"1.5px solid {BD}",
+                            "fontSize": "14px",
+                            "fontWeight": "500",
+                            "color": TXT,
+                            "background": "rgba(248,250,255,.85)",
+                            "outline": "none",
+                            "marginBottom": "22px",
+                            "boxShadow": "0 2px 8px rgba(15,23,42,.04),inset 0 1px 0 rgba(255,255,255,.9)",
+                            "transition": "border-color .2s,box-shadow .2s",
+                        },
+                    ),
+                    html.Button(
+                        "Se connecter →",
+                        id="login-button",
+                        n_clicks=0,
+                        style={
+                            "width": "100%",
+                            "height": "50px",
+                            "border": "none",
+                            "borderRadius": "15px",
+                            "cursor": "pointer",
+                            "color": "white",
+                            "fontSize": "14px",
+                            "fontWeight": "900",
+                            "letterSpacing": ".03em",
+                            "background": "linear-gradient(135deg,#6d28d9 0%,#2563eb 60%,#0ea5e9 100%)",
+                            "backgroundSize": "200% 200%",
+                            "boxShadow": (
+                                "0 14px 32px rgba(37,99,235,.32),"
+                                "inset 0 1px 0 rgba(255,255,255,.20)"
+                            ),
+                            "animation": "gradientShift 4s ease infinite",
+                        },
+                    ),
+                    html.Div(
+                        id="login-error",
+                        style={
+                            "marginTop": "14px",
+                            "textAlign": "center",
+                            "fontSize": "11px",
+                            "fontWeight": "700",
+                            "color": RED,
+                            "minHeight": "18px",
+                        },
+                    ),
+                ],
+            ),
+        ],
+    )
+# ─────────────────────────────────────────────────────────────────────────────
+# ROOT LAYOUT
+# ─────────────────────────────────────────────────────────────────────────────
+def _authenticated_layout() -> html.Div:
+    return html.Div(
+        style={
+            "height": "100vh",
+            "display": "flex",
+            "background": (
+                "radial-gradient(ellipse 70% 45% at 8% -8%,rgba(37,99,235,.13),transparent),"
+                "radial-gradient(ellipse 70% 45% at 92% -8%,rgba(139,92,246,.13),transparent),"
+                "radial-gradient(ellipse 50% 35% at 50% 108%,rgba(14,165,233,.07),transparent),"
+                f"linear-gradient(175deg,#eef3ff 0%,{BG} 100%)"
+            ),
+            "overflow": "hidden",
+        },
+        children=[
+            _sidebar(),
+            html.Div(
+                style={
+                    "flex": "1",
+                    "minWidth": "0",
+                    "height": "100vh",
+                    "overflow": "hidden",
+                    "display": "flex",
+                    "flexDirection": "column",
+                },
+                children=[
+                    _dashboard_page(),
+                    _logs_page(),
+                    _alerts_page(),
+                ],
+            ),
+            dcc.Interval(
+                id="interval",
+                interval=REFRESH_INTERVAL_MS,
+                n_intervals=0,
+            ),
+            dcc.Store(id="current-page", data="logs"),
+            dcc.Store(id="selected-log-store", data=None),
+            dcc.Store(id="rag-open-store", data=False),
+            dcc.Store(id="rag-generated-store", data=False),
+
+            # Passe à True après un clic sur « Utile ».
+            # Il est réinitialisé dès qu'un autre log est sélectionné.
+            dcc.Store(id="feedback-accepted-store", data=False),
+
+            # Compte le nombre de réponses rejetées pour le log sélectionné.
+            # Il est remis à zéro dès qu'un autre log est sélectionné.
+            dcc.Store(id="negative-feedback-count-store", data=0),
+
+            dcc.Store(id="ticket-prefill-store", data=None),
+
+            _ticket_modal(),
+        ],
+)
+app.layout = html.Div(
+    children=[
+        dcc.Location(
+            id="auth-location",
+            refresh=False,
+        ),
+
+        html.Div(
+            id="auth-content",
+        ),
+    ]
+)
 
 @app.callback(
-    Output("alert-table",    "data"),
-    Output("alert-summary",  "children"),
-    Output("alert-last-seen","children"),
+    Output("auth-content", "children"),
+    Input("auth-location", "pathname"),
+)
+
+def display_authenticated_content(
+    pathname: str | None,
+) -> html.Div:
+    del pathname
+
+    if session.get("authenticated"):
+        return _authenticated_layout()
+
+    return _login_page()
+
+@app.callback(
+    Output("login-error", "children"),
+    Output(
+        "auth-location",
+        "pathname",
+        allow_duplicate=True,
+    ),
+    Input("login-button", "n_clicks"),
+    State("login-username", "value"),
+    State("login-password", "value"),
+    prevent_initial_call=True,
+)
+def authenticate_user(
+    n_clicks: int,
+    username: str | None,
+    password: str | None,
+) -> tuple[str, Any]:
+    if not n_clicks:
+        raise PreventUpdate
+
+    username_value = str(username or "").strip()
+    password_value = str(password or "")
+
+    if (
+        username_value == LOGIN_USERNAME
+        and password_value == LOGIN_PASSWORD
+    ):
+        session["authenticated"] = True
+        session["username"] = username_value
+
+        return "", "/"
+
+    return (
+        "Identifiant ou mot de passe incorrect.",
+        no_update,
+    )
+
+#déconnexion
+@app.callback(
+    Output(
+        "auth-location",
+        "pathname",
+        allow_duplicate=True,
+    ),
+    Input("logout-button", "n_clicks"),
+    prevent_initial_call=True,
+)
+def logout_user(n_clicks: int) -> str:
+    if not n_clicks:
+        raise PreventUpdate
+
+    session.clear()
+    return "/login"
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS MÉTIER
+# ─────────────────────────────────────────────────────────────────────────────
+def _visible_rows() -> tuple[list[dict[str, Any]], int]:
+    with _lock:
+        return list(_buffer), _total_received
+
+
+def _filter_rows(
+    rows: list[dict[str, Any]],
+    search: str | None,
+    source: str | None,
+    level: str | None,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    search_text = (search or "").lower().strip()
+    selected_level = level or "all"
+    selected_limit = int(limit or 200)
+    output: list[dict[str, Any]] = []
+
+    for row in rows:
+        if search_text:
+            searchable = " ".join(
+                [
+                    row.get("Timestamp", ""),
+                    row.get("Source", ""),
+                    row.get("Host", ""),
+                    row.get("Message", ""),
+                    row.get("Statut", ""),
+                ]
+            ).lower()
+
+            if search_text not in searchable:
+                continue
+
+        if source and row.get("Source") != source:
+            continue
+
+        if selected_level == "high" and row.get("Statut") != "ANOMALIE":
+            continue
+
+        if selected_level == "normal" and row.get("Statut") != "NORMAL":
+            continue
+
+        output.append(row)
+
+    return output[:selected_limit]
+
+
+def _display_row(
+    row: dict[str, Any],
+    include_model: bool = False,
+) -> dict[str, Any]:
+    columns = TABLE_COLS + (["Model"] if include_model else [])
+    result = {column: row.get(column, "") for column in columns}
+    result["id"] = row.get("id")
+
+    # Le modèle reste disponible dans les données de la table, même s'il
+    # n'est pas affiché comme colonne.
+    result["Model"] = row.get("Model", "unknown")
+    return result
+
+
+def _selected_metadata(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not row:
+        return {
+            "desc": "Sélectionnez un log.",
+            "score": "—",
+            "ratio": "—",
+            "status": _badge(
+                "AUCUN LOG",
+                "#93c5fd",
+                "rgba(147,197,253,.13)",
+            ),
+        }
+
+    is_anomaly = row.get("Statut") == "ANOMALIE"
+    return {
+        "desc": row.get("Message", "—"),
+        "score": str(row.get("Score IA", "—")),
+        "ratio": str(row.get("Ratio", "—")),
+        "status": _badge(
+            row.get("Statut", "UNKNOWN"),
+            "#fca5a5" if is_anomaly else "#6ee7b7",
+            (
+                "rgba(220,38,38,.20)"
+                if is_anomaly
+                else "rgba(5,150,105,.18)"
+            ),
+        ),
+    }
+
+
+def _parse_security_context(row: dict[str, Any]) -> dict[str, str]:
+    message = str(row.get("Message", ""))
+    ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", message)
+    user_match = re.search(
+        r"(?:user=|for user\s+)([a-zA-Z0-9_.-]+)",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    return {
+        "ip": ip_match.group(0) if ip_match else "non détectée",
+        "user": user_match.group(1) if user_match else "non détecté",
+    }
+
+
+def _format_log_sequence(
+    row: dict[str, Any],
+    max_items: int = 10,
+) -> str:
+    raw = row.get("_raw") or {}
+    sequence = raw.get("sequence") or []
+
+    if not isinstance(sequence, list) or not sequence:
+        return "Aucun contexte de séquence disponible."
+
+    lines: list[str] = []
+
+    for item in sequence[-max_items:]:
+        if not isinstance(item, dict):
+            continue
+
+        timestamp = item.get("timestamp", "date inconnue")
+        level = item.get("level", "niveau inconnu")
+        message = item.get("message", "")
+        lines.append(f"- [{timestamp}] {level}: {message}")
+
+    return "\n".join(lines) or "Aucun contexte de séquence disponible."
+
+
+
+NORMAL_NO_ACTION = (
+    "Aucune action corrective n’est requise. "
+    "Conserver ce log dans l’historique et maintenir la surveillance habituelle."
+)
+
+
+def _text_similarity(left: str | None, right: str | None) -> float:
+    left_text = " ".join(str(left or "").lower().split())
+    right_text = " ".join(str(right or "").lower().split())
+
+    if not left_text or not right_text:
+        return 0.0
+
+    return SequenceMatcher(
+        None,
+        left_text,
+        right_text,
+    ).ratio()
+
+
+def _local_alternative_action(
+    row: dict[str, Any],
+    rejected_action: str | None,
+) -> str:
+    """
+    Garantit une action différente lorsque Groq renvoie une recommandation
+    trop proche de celle que l'utilisateur vient de rejeter.
+    """
+    if row.get("Statut") != "ANOMALIE":
+        return NORMAL_NO_ACTION
+
+    message = str(row.get("Message", "")).lower()
+
+    if "exited abnormally" in message or "exit" in message:
+        candidates = [
+            (
+                "Rechercher le code de sortie exact et comparer cet arrêt aux "
+                "exécutions précédentes du même service avant toute relance."
+            ),
+            (
+                "Inspecter les événements immédiatement antérieurs à l’arrêt afin "
+                "d’identifier une dépendance manquante, une erreur de configuration "
+                "ou une saturation de ressources."
+            ),
+        ]
+    elif "session opened" in message or "session closed" in message:
+        candidates = [
+            (
+                "Comparer l’utilisateur, l’horaire et la fréquence de cette session "
+                "avec l’activité habituelle, puis vérifier les journaux "
+                "d’authentification associés."
+            ),
+            (
+                "Contrôler la cohérence entre les ouvertures et fermetures de session "
+                "et rechercher des répétitions anormalement rapprochées."
+            ),
+        ]
+    elif "cupsd" in message:
+        candidates = [
+            (
+                "Vérifier l’état du service CUPS et comparer cet événement à son "
+                "historique récent afin de déterminer pourquoi sa fréquence ou son "
+                "ordre dans la séquence est inhabituel."
+            ),
+            (
+                "Examiner les événements CUPS voisins sans redémarrer le service tant "
+                "qu’aucun échec fonctionnel n’est confirmé."
+            ),
+        ]
+    elif any(
+        token in message
+        for token in ["authentication", "kerberos", "ssh"]
+    ):
+        candidates = [
+            (
+                "Vérifier l’identité de l’utilisateur, l’origine de la connexion et "
+                "la répétition des tentatives dans les journaux d’authentification."
+            ),
+            (
+                "Comparer cette authentification aux habitudes récentes du compte et "
+                "aux connexions provenant du même hôte ou de la même adresse IP."
+            ),
+        ]
+    elif any(token in message for token in ["timeout", "connection"]):
+        candidates = [
+            (
+                "Mesurer la disponibilité du service distant et la latence réseau, "
+                "puis comparer les délais observés aux valeurs habituelles."
+            ),
+            (
+                "Identifier le composant distant concerné et vérifier les erreurs de "
+                "connexion voisines avant de modifier les paramètres de timeout."
+            ),
+        ]
+    else:
+        candidates = [
+            (
+                "Examiner les événements immédiatement avant et après ce log, puis "
+                "comparer le comportement du service à son historique récent."
+            ),
+            (
+                "Vérifier l’état du composant concerné et confirmer que l’écart "
+                "statistique correspond bien à un incident avant toute intervention."
+            ),
+        ]
+
+    for candidate in candidates:
+        if _text_similarity(candidate, rejected_action) < 0.72:
+            return candidate
+
+    return (
+        "Effectuer une vérification ciblée du contexte immédiat de ce log et "
+        "documenter l’écart observé avant de décider d’une intervention."
+    )
+
+
+def _fallback_rag(row: dict[str, Any]) -> dict[str, str]:
+    """Explication utile affichée si Groq est indisponible."""
+    message = str(row.get("Message", ""))
+    lower_message = message.lower()
+    source = row.get("Source", "unknown")
+    host = row.get("Host", "unknown")
+    ratio = row.get("Ratio", "—")
+    threshold = row.get("_threshold_val", ALERT_THRESHOLD)
+    is_anomaly = row.get("Statut") == "ANOMALIE"
+
+    if "exited abnormally" in lower_message or "exit" in lower_message:
+        meaning = (
+            "Le message indique qu’un processus ou un service s’est arrêté "
+            "de manière anormale, avec un code de sortie non nul."
+        )
+        action = (
+            "Identifier le processus concerné, consulter ses logs juste avant "
+            "l’arrêt et vérifier sa configuration ou ses dépendances."
+        )
+    elif "session opened" in lower_message:
+        meaning = (
+            "Le message indique l’ouverture réussie d’une session utilisateur. "
+            "Pris isolément, ce n’est pas nécessairement une erreur."
+        )
+        action = (
+            "Vérifier que l’utilisateur, l’horaire et la fréquence des connexions "
+            "sont cohérents avec l’activité attendue."
+        )
+    elif "session closed" in lower_message:
+        meaning = (
+            "Le message signale la fermeture d’une session utilisateur. "
+            "Cet événement est habituellement normal dans le cycle d’une connexion."
+        )
+        action = (
+            "Contrôler les événements d’ouverture associés et rechercher une "
+            "fermeture répétée ou inhabituellement rapide."
+        )
+    elif "cupsd" in lower_message and "succeeded" in lower_message:
+        meaning = (
+            "Le message décrit une opération réussie du service d’impression CUPS. "
+            "Son contenu est fonctionnellement normal."
+        )
+        action = (
+            "Vérifier surtout pourquoi cet événement apparaît de façon inhabituelle "
+            "dans la séquence, sans traiter automatiquement le service comme défaillant."
+        )
+    elif any(
+        token in lower_message
+        for token in ["authentication", "kerberos", "ssh"]
+    ):
+        meaning = (
+            "Le message concerne une opération d’authentification. "
+            "Il faut distinguer une tentative légitime d’une répétition anormale."
+        )
+        action = (
+            "Contrôler l’utilisateur, l’adresse IP éventuelle, la fréquence des "
+            "tentatives et les événements d’authentification voisins."
+        )
+    elif any(token in lower_message for token in ["timeout", "connection"]):
+        meaning = (
+            "Le message suggère un problème de délai ou de communication entre "
+            "composants."
+        )
+        action = (
+            "Vérifier la disponibilité du service distant, la connectivité réseau "
+            "et les paramètres de timeout."
+        )
+    elif any(
+        token in lower_message
+        for token in ["error", "failed", "failure"]
+    ):
+        meaning = (
+            "Le message contient un échec explicite qui peut signaler un problème "
+            "applicatif, système ou de configuration."
+        )
+        action = (
+            "Examiner les logs précédents et suivants, identifier le composant "
+            "responsable et confirmer si l’échec se répète."
+        )
+    else:
+        meaning = (
+            "Le message décrit un événement système dont le sens précis dépend du "
+            "service et des événements qui l’entourent."
+        )
+        action = (
+            "Corréler ce message avec la séquence complète et vérifier l’état du "
+            "service concerné avant toute intervention."
+        )
+
+    statistical_text = (
+        f"Le modèle le classe comme anomalie car le ratio {ratio} dépasse "
+        f"le seuil {threshold:.2f}x."
+        if is_anomaly
+        else (
+            f"Le ratio {ratio} reste sous le seuil {threshold:.2f}x, "
+            "le comportement est donc considéré comme nominal."
+        )
+    )
+
+    if not is_anomaly:
+        action = NORMAL_NO_ACTION
+
+    return {
+        "analysis": (
+            f"{meaning} {statistical_text} "
+            f"L’événement provient de {source} sur l’hôte {host}; "
+            "le score statistique doit être interprété avec le contexte de la séquence."
+        ),
+        "action": action,
+    }
+
+def _is_groq_rate_limit_error(error: Exception) -> bool:
+    error_text = str(error).lower()
+    return (
+        "rate_limit_exceeded" in error_text
+        or "rate limit reached" in error_text
+        or "error code: 429" in error_text
+    )
+
+
+def _groq_retry_wait_text(error: Exception) -> str:
+    """Retourne une durée propre, par exemple « 6 min 34 s »."""
+    match = re.search(
+        r"try again in\s+(?:(\d+)m)?([\d.]+)s",
+        str(error),
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return "quelques minutes"
+
+    minutes = int(match.group(1) or 0)
+    seconds = round(float(match.group(2)))
+
+    if seconds >= 60:
+        minutes += seconds // 60
+        seconds %= 60
+
+    if minutes:
+        return f"{minutes} min {seconds} s"
+
+    return f"{seconds} s"
+
+
+def _local_regenerated_rag(
+    row: dict[str, Any],
+    rejected_analysis: str | None,
+    rejected_action: str | None,
+) -> dict[str, str]:
+    """
+    Produit une nouvelle réponse locale lorsque Groq est temporairement limité.
+    Elle évite d'afficher une erreur brute et change réellement l'analyse/action.
+    """
+    fallback = _fallback_rag(row)
+    message = str(row.get("Message", "inconnu"))
+    is_anomaly = row.get("Statut") == "ANOMALIE"
+
+    if is_anomaly:
+        alternative_analysis = (
+            f"Nouvelle lecture de l'événement « {message} » : le contenu du log "
+            "doit être interprété séparément du score statistique. "
+            "Le dépassement du seuil indique un comportement inhabituel, mais ne "
+            "prouve pas à lui seul une panne ou une compromission. "
+            "La priorité est donc de confirmer l'écart dans les événements voisins "
+            "et dans l'historique du même service."
+        )
+        alternative_action = _local_alternative_action(
+            row,
+            rejected_action,
+        )
+    else:
+        alternative_analysis = (
+            f"Le message « {message} » ne présente pas d'échec explicite. "
+            "Le modèle conserve cet événement dans la catégorie normale car son "
+            "ratio reste sous le seuil configuré. "
+            "Aucun élément disponible ne justifie une intervention corrective."
+        )
+        alternative_action = NORMAL_NO_ACTION
+
+    if _text_similarity(alternative_analysis, rejected_analysis) >= 0.80:
+        alternative_analysis = (
+            fallback["analysis"]
+            + " Cette reformulation locale remplace temporairement l'appel Groq "
+              "indisponible."
+        )
+
+    return {
+        "analysis": alternative_analysis,
+        "action": alternative_action,
+    }
+
+
+def _groq_request(
+    client: Groq,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    model: str | None = None,
+) -> Any:
+    return client.chat.completions.create(
+        model=model or GROQ_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_completion_tokens=max_tokens,
+        reasoning_effort="low",
+        include_reasoning=False,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "logguardian_analysis",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "analysis": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                    "required": ["analysis", "action"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    )
+
+
+
+def _generate_rag_with_groq(
+    row: dict[str, Any],
+    rejected_analysis: str | None = None,
+    rejected_action: str | None = None,
+) -> dict[str, str]:
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "GROQ_API_KEY n'est pas configurée dans le conteneur monitoring-ui."
+        )
+
+    security = _parse_security_context(row)
+    sequence_context = _format_log_sequence(row)
+    is_anomaly = row.get("Statut") == "ANOMALIE"
+
+    if rejected_analysis or rejected_action:
+        rejection_context = f"""
+L'utilisateur a rejeté cette réponse :
+
+ANALYSE REJETÉE
+{rejected_analysis or "Non renseignée"}
+
+ACTION REJETÉE
+{rejected_action or "Non renseignée"}
+
+Produis une analyse réellement différente.
+Si le statut est ANOMALIE, l'action proposée doit également être concrètement
+différente de l'action rejetée : ne reformule pas simplement la même idée.
+"""
+    else:
+        rejection_context = """
+Il s'agit de la première analyse. Produis directement une explication précise.
+Ne te contente pas de dire que le ratio dépasse le seuil.
+"""
+
+    action_rule = (
+        """
+Le statut est ANOMALIE.
+Propose une action concrète, proportionnée et directement liée au message.
+"""
+        if is_anomaly
+        else f"""
+Le statut est NORMAL.
+Ne propose aucune investigation, aucun redémarrage et aucune action corrective.
+Le champ action doit indiquer uniquement :
+"{NORMAL_NO_ACTION}"
+"""
+    )
+
+    prompt = f"""
+Analyse cet événement LogGuardian.
+
+INFORMATIONS
+- Message : {row.get("Message", "inconnu")}
+- Source : {row.get("Source", "inconnue")}
+- Host : {row.get("Host", "inconnu")}
+- Score IA : {row.get("Score IA", "inconnu")}
+- Ratio : {row.get("Ratio", "inconnu")}
+- Statut : {row.get("Statut", "inconnu")}
+- Seuil : {row.get("_threshold_val", ALERT_THRESHOLD)}
+- Modèle de détection : {row.get("Model", "unknown")}
+- IP détectée : {security["ip"]}
+- Utilisateur détecté : {security["user"]}
+
+CONTEXTE DE LA SÉQUENCE
+{sequence_context}
+
+{rejection_context}
+
+{action_rule}
+
+CONSIGNES
+1. Explique le sens technique du message.
+2. Distingue le sens fonctionnel du message de l'anomalie statistique.
+3. Utilise le contexte de la séquence quand il apporte une information utile.
+4. Ne présente pas automatiquement l'événement comme une attaque.
+5. N'invente aucune information absente des données.
+6. Indique clairement les limites de l'analyse lorsque le contexte est insuffisant.
+7. Réponds en français.
+8. Analyse : 3 à 5 phrases maximum.
+9. Action : 1 à 3 phrases maximum.
+"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Tu es un analyste AIOps spécialisé dans l'interprétation "
+                "des logs et la réponse aux incidents."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    client = Groq(api_key=GROQ_API_KEY)
+
+    def request_and_parse(
+        request_messages: list[dict[str, str]],
+        first_tokens: int = GROQ_MAX_COMPLETION_TOKENS,
+        retry_tokens: int = GROQ_RETRY_COMPLETION_TOKENS,
+    ) -> dict[str, str]:
+        try:
+            response = _groq_request(
+                client,
+                request_messages,
+                max_tokens=first_tokens,
+            )
+        except Exception as first_error:  # noqa: BLE001
+            error_text = str(first_error).lower()
+
+            # Une limite 429 ne doit pas provoquer une nouvelle requête identique.
+            # On essaie éventuellement un modèle de secours configuré.
+            if _is_groq_rate_limit_error(first_error):
+                if (
+                    GROQ_FALLBACK_MODEL
+                    and GROQ_FALLBACK_MODEL != GROQ_MODEL
+                ):
+                    log.warning(
+                        "Limite Groq atteinte sur %s. Essai du modèle de secours %s.",
+                        GROQ_MODEL,
+                        GROQ_FALLBACK_MODEL,
+                    )
+                    response = _groq_request(
+                        client,
+                        request_messages,
+                        max_tokens=GROQ_MAX_COMPLETION_TOKENS,
+                        model=GROQ_FALLBACK_MODEL,
+                    )
+                else:
+                    raise
+
+            elif (
+                "json_validate_failed" in error_text
+                or "max completion tokens" in error_text
+            ):
+                log.warning(
+                    "Première génération Groq invalide. Nouvelle tentative."
+                )
+                response = _groq_request(
+                    client,
+                    request_messages,
+                    max_tokens=retry_tokens,
+                )
+            else:
+                raise
+
+        content = response.choices[0].message.content
+
+        if not content:
+            raise RuntimeError("Groq a retourné une réponse vide.")
+
+        result = json.loads(content)
+        analysis = str(result.get("analysis", "")).strip()
+        action = str(result.get("action", "")).strip()
+
+        if not analysis or not action:
+            raise RuntimeError("La réponse Groq est incomplète.")
+
+        return {
+            "analysis": analysis,
+            "action": action,
+        }
+
+    result = request_and_parse(messages)
+
+    # Pour un log NORMAL, on interdit toute recommandation corrective,
+    # même si le LLM en propose une malgré le prompt.
+    if not is_anomaly:
+        result["action"] = NORMAL_NO_ACTION
+        return result
+
+    # Après un pouce négatif, l'action doit réellement changer.
+    if (
+        rejected_action
+        and _text_similarity(result["action"], rejected_action) >= 0.72
+    ):
+        retry_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "La nouvelle action est encore trop proche de l'action rejetée. "
+                    "Génère une autre analyse et surtout une action opérationnelle "
+                    "différente dans son objectif, pas seulement dans sa formulation."
+                ),
+            },
+        ]
+
+        second_result = request_and_parse(
+            retry_messages,
+            first_tokens=650,
+            retry_tokens=900,
+        )
+
+        if (
+            _text_similarity(
+                second_result["action"],
+                rejected_action,
+            )
+            < 0.72
+        ):
+            result = second_result
+        else:
+            result["action"] = _local_alternative_action(
+                row,
+                rejected_action,
+            )
+
+    return result
+
+def _save_feedback_record(record: dict[str, Any]) -> None:
+    directory = os.path.dirname(FEEDBACK_PATH)
+
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(FEEDBACK_PATH, "a", encoding="utf-8") as feedback_file:
+        feedback_file.write(
+            json.dumps(record, ensure_ascii=False) + "\n"
+        )
+
+
+def _briefing(rows: list[dict[str, Any]]) -> html.Div:
+    if not rows:
+        return html.Div(
+            "Aucun événement reçu.",
+            style={"color": MUT, "fontSize": "13px"},
+        )
+
+    recent = rows[:80]
+    anomalies = [row for row in recent if row["Statut"] == "ANOMALIE"]
+    source_counts = Counter(row["Source"] for row in anomalies)
+    main_source = source_counts.most_common(1)[0][0] if source_counts else "—"
+
+    return html.Div(
+        style={"display": "grid", "gap": "12px"},
+        children=[
+            html.Div(
+                f"{len(recent)} événements récents analysés.",
+                style={"fontSize": "13px", "fontWeight": "800", "color": TXT},
+            ),
+            html.Div(
+                f"{len(anomalies)} anomalies dans la fenêtre courante.",
+                style={"fontSize": "12px", "color": MUT},
+            ),
+            html.Div(
+                f"Source la plus concernée : {main_source}.",
+                style={"fontSize": "12px", "color": MUT},
+            ),
+            html.Div(
+                "Prioriser les ratios élevés puis utiliser l'analyse IA pour "
+                "interpréter le message et son contexte.",
+                style={"fontSize": "12px", "color": MUT, "lineHeight": "1.6"},
+            ),
+        ],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — NAVIGATION / TEMPS
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("current-page", "data"),
+    Input("nav-dashboard", "n_clicks"),
+    Input("nav-logs", "n_clicks"),
+    Input("nav-alerts", "n_clicks"),
+    State("current-page", "data"),
+    prevent_initial_call=True,
+)
+def navigate(
+    dashboard_clicks: int,
+    logs_clicks: int,
+    alerts_clicks: int,
+    current_page: str,
+) -> str:
+    del dashboard_clicks, logs_clicks, alerts_clicks
+
+    if not callback_context.triggered:
+        return current_page
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0]
+    return {
+        "nav-dashboard": "dashboard",
+        "nav-logs": "logs",
+        "nav-alerts": "alerts",
+    }.get(trigger, current_page)
+
+
+@app.callback(
+    Output("page-dashboard", "style"),
+    Output("page-logs", "style"),
+    Output("page-alerts", "style"),
+    Input("current-page", "data"),
+)
+def show_page(page: str) -> tuple[dict[str, str], ...]:
+    dashboard_style = {
+        "display": "block",
+        "height": "100%",
+        "overflow": "auto",
+    }
+    logs_style = {
+        "display": "block",
+        "height": "100%",
+        "overflow": "hidden",
+    }
+    hidden = {"display": "none"}
+
+    return (
+        dashboard_style if page == "dashboard" else hidden,
+        logs_style if page == "logs" else hidden,
+        dashboard_style if page == "alerts" else hidden,
+    )
+
+
+@app.callback(
+    Output("clock-dashboard", "children"),
+    Output("clock-logs", "children"),
+    Output("clock-alerts", "children"),
     Input("interval", "n_intervals"),
 )
-def refresh_alerts(_):
+def update_clocks(_: int) -> tuple[str, str, str]:
+    value = datetime.now().strftime("%d/%m/%Y • %H:%M:%S")
+    return value, value, value
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — COCKPIT
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("m-total", "children"),
+    Output("m-anom", "children"),
+    Output("m-score", "children"),
+    Output("m-sources", "children"),
+    Output("m-risk", "children"),
+    Output("fig-stream", "figure"),
+    Output("fig-risk", "figure"),
+    Output("fig-services", "figure"),
+    Output("fig-score", "figure"),
+    Output("ai-briefing", "children"),
+    Input("interval", "n_intervals"),
+)
+def update_dashboard(_: int) -> tuple[Any, ...]:
+    rows, total = _visible_rows()
+    anomalies = [row for row in rows if row["Statut"] == "ANOMALIE"]
+    average_score = (
+        sum(row.get("_score_val", 0.0) for row in rows) / len(rows)
+        if rows
+        else 0.0
+    )
+    sources = len({row["Source"] for row in anomalies})
+    risk = round(len(anomalies) / len(rows) * 100, 1) if rows else 0.0
+
+    return (
+        str(total),
+        str(len(anomalies)),
+        f"{average_score:.2f}",
+        str(sources),
+        f"{risk}%",
+        _stream_fig(rows),
+        _risk_fig(rows),
+        _services_fig(rows),
+        _score_fig(rows),
+        _briefing(rows),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — TABLE / SÉLECTION
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("main-table", "data"),
+    Output("source-filter", "options"),
+    Output("logs-count", "children"),
+    Input("interval", "n_intervals"),
+    Input("current-page", "data"),
+    Input("search-text", "value"),
+    Input("source-filter", "value"),
+    Input("level-filter", "value"),
+    Input("limit-filter", "value"),
+)
+def update_logs(
+    _: int,
+    page: str,
+    search: str | None,
+    source: str | None,
+    level: str | None,
+    limit: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], str]:
+    del page
+    rows, _total = _visible_rows()
+    filtered = _filter_rows(rows, search, source, level, limit)
+    options = [
+        {"label": value, "value": value}
+        for value in sorted(
+            {row["Source"] for row in rows if row.get("Source")}
+        )
+    ]
+
+    return (
+        [_display_row(row) for row in filtered],
+        options,
+        f"{len(filtered)} / {len(rows)}",
+    )
+
+
+@app.callback(
+    Output("selected-log-store", "data"),
+    Input("main-table", "active_cell"),
+    State("main-table", "data"),
+    prevent_initial_call=True,
+)
+def store_selected_log(
+    active_cell: dict[str, Any] | None,
+    table_data: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    if not active_cell or not table_data:
+        return None
+
+    selected_id = active_cell.get("row_id")
+
+    if not selected_id:
+        row_index = active_cell.get("row")
+
+        if row_index is None or row_index >= len(table_data):
+            return None
+
+        selected_id = table_data[row_index].get("id")
+
     with _lock:
-        rows = list(_buffer)
+        full_row = next(
+            (
+                row
+                for row in _buffer
+                if row.get("id") == selected_id
+            ),
+            None,
+        )
 
-    critical = [r for r in rows if r.get("_ratio_val", 0) > 1.3]
+    if full_row:
+        return full_row
 
-    alert_rows = [{
-        "Timestamp": r.get("Timestamp", ""),
-        "Source":    r.get("Source", ""),
-        "Host":      r.get("Host", ""),
-        "Message":   r.get("Message", ""),
-        "Score IA":  r.get("Score IA", ""),
-        "Ratio":     r.get("Ratio", ""),
-    } for r in critical]
+    return next(
+        (
+            row
+            for row in table_data
+            if row.get("id") == selected_id
+        ),
+        None,
+    )
 
-    summary   = f"{len(critical)} ALERTE(S) CRITIQUE(S) ACTIVE(S)"
-    last_seen = f"Dernier événement : {critical[0]['Timestamp'] if critical else '—'}"
-    return alert_rows, summary, last_seen
+
+@app.callback(
+    Output("show-rag-btn", "disabled"),
+    Output("show-rag-btn", "style"),
+    Output("show-rag-btn", "children"),
+    Input("selected-log-store", "data"),
+    Input("rag-generated-store", "data"),
+    Input("rag-open-store", "data"),
+)
+def update_analyze_button(
+    row: dict[str, Any] | None,
+    rag_generated: bool,
+    rag_open: bool,
+) -> tuple[bool, dict[str, Any], str]:
+    disabled = not bool(row)
+
+    if disabled:
+        return (
+            True,
+            _analyze_button_style(True),
+            "✨ Analyser avec l’IA",
+        )
+
+    if rag_generated:
+        label = (
+            "🙈 Masquer l’analyse"
+            if rag_open
+            else "👁 Afficher l’analyse"
+        )
+
+        return (
+            False,
+            _analyze_button_style(False, generated=True),
+            label,
+        )
+
+    return (
+        False,
+        _analyze_button_style(False),
+        "✨ Analyser avec l’IA",
+    )
+
+
+@app.callback(
+    Output("rag-open-store", "data"),
+    Input("show-rag-btn", "n_clicks"),
+    Input("close-rag-btn", "n_clicks"),
+    Input("selected-log-store", "data"),
+    State("rag-open-store", "data"),
+    prevent_initial_call=True,
+)
+def change_rag_visibility(
+    show_clicks: int,
+    close_clicks: int,
+    selected_row: dict[str, Any] | None,
+    current_open: bool,
+) -> bool:
+    del show_clicks, close_clicks
+
+    if not callback_context.triggered:
+        return bool(current_open)
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0]
+
+    if trigger == "show-rag-btn":
+        if not selected_row:
+            return False
+
+        # Le même bouton ouvre ou masque le panneau.
+        return not bool(current_open)
+
+    # Ferme également le panneau lors de la sélection d'un nouveau log.
+    if trigger in {"close-rag-btn", "selected-log-store"}:
+        return False
+
+    return bool(current_open)
+
+
+@app.callback(
+    Output("logs-workspace", "style"),
+    Output("rag-panel-wrapper", "style"),
+    Input("rag-open-store", "data"),
+)
+def apply_rag_visibility(
+    opened: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return _logs_workspace_style(bool(opened)), _rag_wrapper_style(bool(opened))
+
+
+@app.callback(
+    Output("rag-desc", "children"),
+    Output("rag-score", "children"),
+    Output("rag-ratio", "children"),
+    Output("rag-status-chip", "children"),
+    Output("rag-analysis", "children"),
+    Output("rag-action", "children"),
+    Output("feedback-status", "children"),
+    Output("rag-generated-store", "data"),
+    Output("feedback-accepted-store", "data"),
+    Output("negative-feedback-count-store", "data"),
+    Input("selected-log-store", "data"),
+)
+def render_selected_log(
+    row: dict[str, Any] | None,
+) -> tuple[Any, ...]:
+    metadata = _selected_metadata(row)
+
+    if not row:
+        return (
+            metadata["desc"],
+            metadata["score"],
+            metadata["ratio"],
+            metadata["status"],
+            "Sélectionnez un log puis cliquez sur « Analyser avec l’IA ».",
+            "Aucune recommandation disponible.",
+            "Aucune analyse lancée.",
+            False,
+            False,
+            0,
+        )
+
+    return (
+        metadata["desc"],
+        metadata["score"],
+        metadata["ratio"],
+        metadata["status"],
+        "Cliquez sur « Analyser avec l’IA » pour obtenir une explication contextualisée.",
+        "La recommandation apparaîtra après l’analyse.",
+        "Log sélectionné — analyse non lancée.",
+        False,
+        False,
+        0,
+    )
+
+
+@app.callback(
+    Output("fb-up", "disabled"),
+    Output("fb-up", "style"),
+    Output("fb-up", "children"),
+    Output("fb-down", "disabled"),
+    Output("fb-down", "style"),
+    Output("fb-down", "children"),
+    Input("selected-log-store", "data"),
+    Input("rag-generated-store", "data"),
+    Input("feedback-accepted-store", "data"),
+    Input("negative-feedback-count-store", "data"),
+)
+def update_feedback_buttons(
+    row: dict[str, Any] | None,
+    rag_generated: bool,
+    feedback_accepted: bool,
+    negative_feedback_count: int | None,
+) -> tuple[bool, dict[str, Any], str, bool, dict[str, Any], str]:
+    """
+    Les boutons sont actifs seulement après une analyse.
+    Ils sont verrouillés après validation ou après 5 réponses rejetées.
+    """
+    feedback_available = bool(row) and bool(rag_generated)
+    rejected_count = int(negative_feedback_count or 0)
+
+    if not feedback_available:
+        return (
+            True,
+            _feedback_button_style("positive", disabled=True),
+            "👍 Utile",
+            True,
+            _feedback_button_style("negative", disabled=True),
+            "👎 Pas utile",
+        )
+
+    if feedback_accepted:
+        return (
+            True,
+            _feedback_button_style(
+                "positive",
+                disabled=True,
+                accepted=True,
+            ),
+            "✅ Réponse validée",
+            True,
+            _feedback_button_style(
+                "negative",
+                disabled=True,
+                accepted=True,
+            ),
+            "🔒 Pas utile",
+        )
+
+    if rejected_count >= MAX_NEGATIVE_FEEDBACKS:
+        return (
+            True,
+            _feedback_button_style("positive", disabled=True),
+            "🔒 Limite atteinte",
+            True,
+            _feedback_button_style("negative", disabled=True),
+            "📧 Contacter le support",
+        )
+
+    return (
+        False,
+        _feedback_button_style("positive"),
+        "👍 Utile",
+        False,
+        _feedback_button_style("negative"),
+        (
+            f"👎 Pas utile "
+            f"({rejected_count}/{MAX_NEGATIVE_FEEDBACKS})"
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — PREMIÈRE ANALYSE / FEEDBACK
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("rag-analysis", "children", allow_duplicate=True),
+    Output("rag-action", "children", allow_duplicate=True),
+    Output("feedback-status", "children", allow_duplicate=True),
+    Output("rag-generated-store", "data", allow_duplicate=True),
+    Input("show-rag-btn", "n_clicks"),
+    State("selected-log-store", "data"),
+    State("rag-generated-store", "data"),
+    prevent_initial_call=True,
+)
+def generate_initial_rag(
+    n_clicks: int,
+    row: dict[str, Any] | None,
+    rag_generated: bool,
+) -> tuple[Any, ...]:
+    if not n_clicks:
+        raise PreventUpdate
+
+    if not row:
+        return (
+            no_update,
+            no_update,
+            "Sélectionnez d'abord un log.",
+            False,
+        )
+
+    # Si l'analyse existe déjà, le bouton sert seulement à rouvrir
+    # le panneau. Aucun nouvel appel Groq n'est effectué.
+    if rag_generated:
+        raise PreventUpdate
+
+    try:
+        result = _generate_rag_with_groq(row)
+        return (
+            result["analysis"],
+            result["action"],
+            f"✨ Analyse générée avec {GROQ_MODEL}.",
+            True,
+        )
+
+    except Exception as error:  # noqa: BLE001
+        log.exception("Erreur pendant l'analyse initiale Groq")
+        fallback = _fallback_rag(row)
+
+        # L'explication reste visible même si Groq est indisponible.
+        return (
+            fallback["analysis"],
+            fallback["action"],
+            f"⚠️ Analyse locale affichée — Groq indisponible : {error}",
+            True,
+        )
+
+
+@app.callback(
+    Output("rag-analysis", "children", allow_duplicate=True),
+    Output("rag-action", "children", allow_duplicate=True),
+    Output("feedback-status", "children", allow_duplicate=True),
+    Output("feedback-accepted-store", "data", allow_duplicate=True),
+    Output(
+        "negative-feedback-count-store",
+        "data",
+        allow_duplicate=True,
+    ),
+    Input("fb-up", "n_clicks"),
+    Input("fb-down", "n_clicks"),
+    State("selected-log-store", "data"),
+    State("rag-analysis", "children"),
+    State("rag-action", "children"),
+    State("rag-generated-store", "data"),
+    State("feedback-accepted-store", "data"),
+    State("negative-feedback-count-store", "data"),
+    prevent_initial_call=True,
+)
+def save_feedback(
+    up_clicks: int,
+    down_clicks: int,
+    row: dict[str, Any] | None,
+    current_analysis: Any,
+    current_action: Any,
+    rag_generated: bool,
+    feedback_accepted: bool,
+    negative_feedback_count: int | None,
+) -> tuple[Any, Any, str, Any, Any]:
+    del up_clicks, down_clicks
+
+    if not row:
+        return (
+            no_update,
+            no_update,
+            "Sélectionnez d'abord un log.",
+            no_update,
+            no_update,
+        )
+
+    if not rag_generated:
+        return (
+            no_update,
+            no_update,
+            "Lancez d'abord l'analyse IA avant de donner un feedback.",
+            no_update,
+            no_update,
+        )
+
+    if not callback_context.triggered:
+        raise PreventUpdate
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0]
+    analysis_text = str(current_analysis or "").strip()
+    action_text = str(current_action or "").strip()
+    rejected_count = int(negative_feedback_count or 0)
+
+    # Garde-fou côté serveur après validation.
+    if feedback_accepted:
+        return (
+            no_update,
+            no_update,
+            "✅ Cette réponse a déjà été validée. Le feedback est verrouillé.",
+            True,
+            no_update,
+        )
+
+    # Garde-fou côté serveur après atteinte de la limite.
+    if rejected_count >= MAX_NEGATIVE_FEEDBACKS:
+        return (
+            no_update,
+            no_update,
+            (
+                "🔒 La limite de réponses a été atteinte. "
+                f"Contactez {SUPPORT_EMAIL} pour une analyse manuelle."
+            ),
+            no_update,
+            MAX_NEGATIVE_FEEDBACKS,
+        )
+
+    if trigger == "fb-up":
+        positive_record = {
+            "feedback_timestamp": datetime.now().isoformat(timespec="seconds"),
+            "feedback": "positive",
+            "accepted": True,
+            "negative_feedback_count": rejected_count,
+            "log_id": row.get("id"),
+            "source": row.get("Source"),
+            "host": row.get("Host"),
+            "message": row.get("Message"),
+            "score_ia": row.get("Score IA"),
+            "ratio": row.get("Ratio"),
+            "statut": row.get("Statut"),
+            "model_version": row.get("Model", "unknown"),
+            "accepted_rag_analysis": analysis_text,
+            "accepted_rag_recommendation": action_text,
+            "generator": GROQ_MODEL,
+            "alert_threshold": row.get(
+                "_threshold_val",
+                ALERT_THRESHOLD,
+            ),
+        }
+
+        try:
+            _save_feedback_record(positive_record)
+            return (
+                no_update,
+                no_update,
+                "✅ Explication validée et acceptation enregistrée.",
+                True,
+                no_update,
+            )
+        except Exception as error:  # noqa: BLE001
+            log.exception("Erreur sauvegarde feedback positif")
+            return (
+                no_update,
+                no_update,
+                f"⚠️ Validation non sauvegardée : {error}",
+                no_update,
+                no_update,
+            )
+
+    if trigger != "fb-down":
+        raise PreventUpdate
+
+    # La réponse actuellement affichée vient d'être rejetée.
+    # Exemple :
+    # - réponse initiale rejetée -> tentative 1, génération de la réponse 2 ;
+    # - réponse 5 rejetée -> tentative 5, arrêt sans nouvel appel Groq.
+    next_rejected_count = rejected_count + 1
+
+    record: dict[str, Any] = {
+        "feedback_timestamp": datetime.now().isoformat(timespec="seconds"),
+        "feedback": "negative",
+        "negative_feedback_count": next_rejected_count,
+        "max_negative_feedbacks": MAX_NEGATIVE_FEEDBACKS,
+        "log_id": row.get("id"),
+        "source": row.get("Source"),
+        "host": row.get("Host"),
+        "message": row.get("Message"),
+        "score_ia": row.get("Score IA"),
+        "ratio": row.get("Ratio"),
+        "statut": row.get("Statut"),
+        "model_version": row.get("Model", "unknown"),
+        "rag_analysis": analysis_text,
+        "rag_recommendation": action_text,
+        "rag_version": "rag_v2_groq",
+        "prompt_version": "initial_or_previous_response",
+        "regeneration_prompt_version": "groq_regeneration_v2",
+        "alert_threshold": row.get(
+            "_threshold_val",
+            ALERT_THRESHOLD,
+        ),
+    }
+
+    # La 5e réponse vient d'être rejetée : on sauvegarde ce rejet,
+    # on n'effectue plus d'appel Groq et on oriente vers le support.
+    if next_rejected_count >= MAX_NEGATIVE_FEEDBACKS:
+        record.update(
+            {
+                "replacement_rag_analysis": None,
+                "replacement_rag_recommendation": None,
+                "replacement_generator": None,
+                "groq_success": False,
+                "groq_error": None,
+                "fallback_used": False,
+                "closed_after_max_feedbacks": True,
+                "support_email": SUPPORT_EMAIL,
+            }
+        )
+
+        try:
+            _save_feedback_record(record)
+        except Exception as error:  # noqa: BLE001
+            log.exception("Erreur sauvegarde du dernier feedback négatif")
+            return (
+                no_update,
+                no_update,
+                f"⚠️ Feedback non sauvegardé : {error}",
+                no_update,
+                rejected_count,
+            )
+
+        return (
+            no_update,
+            no_update,
+            (
+                f"🔒 Après {MAX_NEGATIVE_FEEDBACKS} réponses, "
+                "aucune proposition n'a été jugée utile. "
+                f"Contactez la personne en charge à {SUPPORT_EMAIL} "
+                "en lui transmettant le message du log, le score et le ratio."
+            ),
+            False,
+            next_rejected_count,
+        )
+
+    replacement: dict[str, str] | None = None
+    generation_notice: str | None = None
+
+    try:
+        replacement = _generate_rag_with_groq(
+            row,
+            rejected_analysis=analysis_text,
+            rejected_action=action_text,
+        )
+        record.update(
+            {
+                "replacement_rag_analysis": replacement["analysis"],
+                "replacement_rag_recommendation": replacement["action"],
+                "replacement_generator": GROQ_MODEL,
+                "groq_success": True,
+                "groq_error": None,
+                "fallback_used": False,
+                "closed_after_max_feedbacks": False,
+            }
+        )
+
+    except Exception as error:  # noqa: BLE001
+        log.exception("Erreur pendant la régénération Groq")
+
+        if _is_groq_rate_limit_error(error):
+            wait_text = _groq_retry_wait_text(error)
+            replacement = _local_regenerated_rag(
+                row,
+                rejected_analysis=analysis_text,
+                rejected_action=action_text,
+            )
+            generation_notice = (
+                "⏳ Quota Groq temporairement atteint. "
+                "Une nouvelle réponse locale a été affichée. "
+                f"Le modèle Groq devrait être réutilisable dans environ {wait_text}."
+            )
+
+            record.update(
+                {
+                    "replacement_rag_analysis": replacement["analysis"],
+                    "replacement_rag_recommendation": replacement["action"],
+                    "replacement_generator": "local_rate_limit_fallback",
+                    "groq_success": False,
+                    "groq_error": str(error),
+                    "fallback_used": True,
+                    "rate_limit_wait": wait_text,
+                    "closed_after_max_feedbacks": False,
+                }
+            )
+        else:
+            record.update(
+                {
+                    "replacement_rag_analysis": None,
+                    "replacement_rag_recommendation": None,
+                    "replacement_generator": GROQ_MODEL,
+                    "groq_success": False,
+                    "groq_error": str(error),
+                    "fallback_used": False,
+                    "closed_after_max_feedbacks": False,
+                }
+            )
+
+    try:
+        _save_feedback_record(record)
+    except Exception as error:  # noqa: BLE001
+        log.exception("Erreur sauvegarde feedback négatif")
+        return (
+            no_update,
+            no_update,
+            f"⚠️ Feedback non sauvegardé : {error}",
+            no_update,
+            rejected_count,
+        )
+
+    if replacement is None:
+        return (
+            no_update,
+            no_update,
+            (
+                "👎 Feedback enregistré, mais la nouvelle analyse n'a pas "
+                f"pu être générée : {record['groq_error']}"
+            ),
+            no_update,
+            next_rejected_count,
+        )
+
+    return (
+        replacement["analysis"],
+        replacement["action"],
+        generation_notice or "🔄 Nouvelle réponse générée.",
+        False,
+        next_rejected_count,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACK — INCIDENT BOARD
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("alert-table", "data"),
+    Output("alert-strip", "children"),
+    Input("interval", "n_intervals"),
+)
+def update_alerts(_: int) -> tuple[list[dict[str, Any]], html.Div]:
+    rows, _total = _visible_rows()
+    critical = [row for row in rows if row["Statut"] == "ANOMALIE"]
+
+    with _lock:
+        total_alerts = _total_alerts_received
+
+    last_time = critical[0]["Timestamp"][-8:] if critical else "—"
+    top_sources = Counter(row["Source"] for row in critical).most_common(1)
+    top_source = top_sources[0][0] if top_sources else "—"
+
+    strip = html.Div(
+        style={
+            "display": "grid",
+            "gridTemplateColumns": "1fr 1fr 1fr",
+            "gap": "14px",
+        },
+        children=[
+            _metric_card(
+                "total des alertes",
+                "alert-total",
+                RED,
+                "🚨",
+                "TOTAL",
+            ),
+            _metric_card(
+                "dernier événement",
+                "alert-last",
+                ORAN,
+                "⏱",
+                "LAST",
+            ),
+            _metric_card(
+                "source principale",
+                "alert-source",
+                CYAN,
+                "🖥",
+                "TOP",
+            ),
+        ],
+    )
+
+    strip.children[0].children[2].children = str(total_alerts)
+    strip.children[1].children[2].children = last_time
+    strip.children[2].children[2].children = top_source
+
+    return (
+        [_display_row(row, include_model=True) for row in critical],
+        strip,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — TICKET DE SUPPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MODAL_HIDDEN: dict[str, Any] = {
+    "display": "none",
+    "position": "fixed",
+    "top": "0",
+    "left": "0",
+    "right": "0",
+    "bottom": "0",
+    "zIndex": "9999",
+    "alignItems": "center",
+    "justifyContent": "center",
+    "background": "rgba(5,10,25,.78)",
+    "backdropFilter": "blur(12px)",
+    "WebkitBackdropFilter": "blur(12px)",
+}
+_MODAL_VISIBLE: dict[str, Any] = {**_MODAL_HIDDEN, "display": "flex"}
+
+
+def _ticket_pill(label: str, value: str, accent: str) -> html.Div:
+    return html.Div(
+        style={
+            "background": f"{accent}0d",
+            "border": f"1px solid {accent}30",
+            "borderRadius": "12px",
+            "padding": "10px 12px",
+        },
+        children=[
+            html.Div(
+                label,
+                style={
+                    "fontSize": "8px",
+                    "fontWeight": "900",
+                    "color": accent,
+                    "textTransform": "uppercase",
+                    "letterSpacing": ".12em",
+                    "fontFamily": "JetBrains Mono, monospace",
+                    "marginBottom": "4px",
+                },
+            ),
+            html.Div(
+                value or "—",
+                style={
+                    "fontSize": "12px",
+                    "fontWeight": "700",
+                    "color": TXT,
+                    "overflow": "hidden",
+                    "textOverflow": "ellipsis",
+                    "whiteSpace": "nowrap",
+                },
+            ),
+        ],
+    )
+
+
+@app.callback(
+    Output("ticket-modal-overlay", "style"),
+    Output("ticket-prefill-store", "data"),
+    Output("ticket-log-info", "children"),
+    Output("ticket-last-analysis", "children"),
+    Output("ticket-last-action", "children"),
+    Output("ticket-user-message", "value"),
+    Output("ticket-send-status", "children"),
+    Input("negative-feedback-count-store", "data"),
+    Input("ticket-close-btn", "n_clicks"),
+    Input("ticket-cancel-btn", "n_clicks"),
+    Input("ticket-send-btn", "n_clicks"),
+    State("selected-log-store", "data"),
+    State("rag-analysis", "children"),
+    State("rag-action", "children"),
+    State("ticket-prefill-store", "data"),
+    State("ticket-user-message", "value"),
+    prevent_initial_call=True,
+)
+def manage_ticket_modal(
+    count: int | None,
+    _close: int,
+    _cancel: int,
+    _send: int,
+    row: dict[str, Any] | None,
+    analysis: Any,
+    action: Any,
+    prefill: dict[str, Any] | None,
+    user_message: str | None,
+) -> tuple[Any, ...]:
+    del _close, _cancel, _send
+
+    if not callback_context.triggered:
+        raise PreventUpdate
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0]
+
+    # ── Fermer le popup ────────────────────────────────────────────────────
+    if trigger in {"ticket-close-btn", "ticket-cancel-btn"}:
+        return (
+            _MODAL_HIDDEN, no_update, no_update, no_update,
+            no_update, no_update, "",
+        )
+
+    # ── Envoyer le ticket ──────────────────────────────────────────────────
+    if trigger == "ticket-send-btn":
+        if not prefill:
+            return (
+                no_update, no_update, no_update, no_update,
+                no_update, no_update, "⚠️ Aucun log sélectionné.",
+            )
+        ticket = {
+            "ticket_type": "support_ticket",
+            "submitted_at": datetime.now().isoformat(timespec="seconds"),
+            **prefill,
+            "user_message": (user_message or "").strip(),
+            "negative_feedback_count": MAX_NEGATIVE_FEEDBACKS,
+        }
+        try:
+            _publish_support_ticket(ticket)
+            log.info(
+                "Ticket support publié | log_id=%s | source=%s",
+                ticket.get("log_id"),
+                ticket.get("source"),
+            )
+            return (
+                _MODAL_HIDDEN, no_update, no_update, no_update,
+                no_update, no_update, "",
+            )
+        except Exception as err:  # noqa: BLE001
+            log.exception("Erreur publication ticket Kafka")
+            return (
+                no_update, no_update, no_update, no_update,
+                no_update, no_update, f"⚠️ Envoi échoué : {err}",
+            )
+
+    # ── Ouvrir le popup après 5 rejets ─────────────────────────────────────
+    if trigger == "negative-feedback-count-store":
+        if int(count or 0) >= MAX_NEGATIVE_FEEDBACKS and row:
+            new_prefill: dict[str, Any] = {
+                "log_id": row.get("id", ""),
+                "source": row.get("Source", ""),
+                "host": row.get("Host", ""),
+                "message": row.get("Message", ""),
+                "score_ia": row.get("Score IA", ""),
+                "ratio": row.get("Ratio", ""),
+                "statut": row.get("Statut", ""),
+                "model_version": row.get("Model", ""),
+                "timestamp": row.get("Timestamp", ""),
+                "last_analysis": str(analysis or ""),
+                "last_action": str(action or ""),
+            }
+            is_anomaly = new_prefill["statut"] == "ANOMALIE"
+            statut_accent = RED if is_anomaly else GREEN
+            log_info = [
+                _ticket_pill("Source", new_prefill["source"], BLUE),
+                _ticket_pill("Host", new_prefill["host"], CYAN),
+                _ticket_pill("Statut", new_prefill["statut"], statut_accent),
+                _ticket_pill("Score IA", new_prefill["score_ia"], PURP),
+                _ticket_pill("Ratio", new_prefill["ratio"], ORAN),
+                _ticket_pill("Date", new_prefill["timestamp"], MUT),
+            ]
+            return (
+                _MODAL_VISIBLE,
+                new_prefill,
+                log_info,
+                new_prefill["last_analysis"] or "—",
+                new_prefill["last_action"] or "—",
+                "",
+                "",
+            )
+
+    raise PreventUpdate
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8050, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=8050,
+        debug=False,
+    )

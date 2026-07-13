@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -8,6 +6,9 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -19,8 +20,8 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       # Deux listeners :
-      #   PLAINTEXT        -> port 29092, utilise entre containers (nom DNS = kafka)
-      #   PLAINTEXT_HOST   -> port 9092,  utilise depuis la machine hote (localhost)
+      #   PLAINTEXT        -> port 29092, utilisé entre containers (nom DNS = kafka)
+      #   PLAINTEXT_HOST   -> port 9092,  utilisé depuis la machine hôte (localhost)
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
@@ -31,12 +32,13 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_RETENTION_HOURS: 24
     healthcheck:
-      # Le healthcheck tourne DANS le container -> port interne 29092
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:29092", "--list"]
       interval: 10s
       timeout: 10s
       retries: 15
       start_period: 30s
+    volumes:
+      - kafka-data:/var/lib/kafka/data
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -63,6 +65,7 @@ services:
       REPLAY_SPEED: "100"
       DATA_DIR: /data
       LOG_SOURCES: linux,ssh,hadoop,spark,supercomputer,hdfs
+      PYTHONUNBUFFERED: "1"
     restart: on-failure
 
   etl-processor:
@@ -83,6 +86,7 @@ services:
       BATCH_TIMEOUT_SEC: "30"
       LOCAL_MODE: "true"
       LOCAL_OUTPUT_DIR: /tmp/etl-output
+      PYTHONUNBUFFERED: "1"
     restart: on-failure
 
   ml-model:
@@ -102,6 +106,7 @@ services:
       LOCAL_MODEL_MODE: "true"
       SEQUENCE_LENGTH: "10"
       DEVICE: cpu
+      PYTHONUNBUFFERED: "1"
     restart: on-failure
 
   monitoring-ui:
@@ -115,7 +120,70 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: logs-anomalies-ml
+      KAFKA_SUPPORT_TOPIC: support-tickets
+      MAX_ROWS: 2000
+      REFRESH_INTERVAL_MS: 3000
+      ALERT_THRESHOLD: 1.3
+      PYTHONUNBUFFERED: "1"
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
+      FEEDBACK_PATH: /app/feedback/rag_feedback.jsonl
+      RAG_NEGATIVE_LIMIT: ${RAG_NEGATIVE_LIMIT:-20}
+      LOGIN_USERNAME: ${LOGIN_USERNAME}
+      LOGIN_PASSWORD: ${LOGIN_PASSWORD}
+      DASH_SECRET_KEY: ${DASH_SECRET_KEY}
+      MAX_NEGATIVE_FEEDBACKS: ${MAX_NEGATIVE_FEEDBACKS:-5}
+      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-admin@log-guardian.fr}
+    volumes:
+      - ./feedback:/app/feedback
     restart: on-failure
+
+  # ── Service 1 : alertes anomalies (batch) ─────────────────────────────────
+  email-sender:
+    build:
+      context: ./email-sender
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: logs-anomalies-ml
+      KAFKA_GROUP_ID: logguardian-alert-email-sender
+      KAFKA_AUTO_OFFSET_RESET: latest
+      ALERT_BATCH_SECONDS: ${ALERT_BATCH_SECONDS:-900}
+      ALERT_BATCH_MAX_SIZE: ${ALERT_BATCH_MAX_SIZE:-100}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      MAIL_TO: ${MAIL_TO}
+      PYTHONUNBUFFERED: "1"
+
+  # ── Service 2 : tickets support (immédiat) ────────────────────────────────
+  ticket-sender:
+    build:
+      context: ./ticket-sender
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_SUPPORT_TOPIC: support-tickets
+      KAFKA_GROUP_ID: logguardian-support-ticket-sender
+      KAFKA_AUTO_OFFSET_RESET: earliest
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      MAIL_TO: ${MAIL_TO}
+      SUPPORT_MAIL_TO: ${SUPPORT_MAIL_TO:-}
+      PYTHONUNBUFFERED: "1"
+
 
 volumes:
   etl-output:
+  kafka-data:
+  zookeeper-data:
+  zookeeper-log:
