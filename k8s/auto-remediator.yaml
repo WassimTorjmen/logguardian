@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────
+# Identité du service : ServiceAccount dans le namespace logguardian
+# ─────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auto-remediator
+  namespace: logguardian
+---
+# ─────────────────────────────────────────────────────────
+# Permissions : peut lister et supprimer des pods dans demo-apps uniquement
+# ─────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-remediator
+  namespace: demo-apps
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+---
+# ─────────────────────────────────────────────────────────
+# Lien : le SA (logguardian/auto-remediator) peut utiliser le Role (demo-apps/pod-remediator)
+# ─────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auto-remediator-can-delete-pods
+  namespace: demo-apps
+subjects:
+  - kind: ServiceAccount
+    name: auto-remediator
+    namespace: logguardian
+roleRef:
+  kind: Role
+  name: pod-remediator
+  apiGroup: rbac.authorization.k8s.io
+---
+# ─────────────────────────────────────────────────────────
+# ConfigMap : paramètres du service (modifiables sans rebuild)
+# ─────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auto-remediator-config
+  namespace: logguardian
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka.logguardian.svc.cluster.local:29092
+  KAFKA_TOPIC: logs-anomalies-ml
+  KAFKA_GROUP_ID: auto-remediator
+  NAMESPACE_TO_WATCH: demo-apps
+  CRITICAL_THRESHOLD: "2.0"
+  WARN_THRESHOLD: "1.3"
+  COOLDOWN_SECONDS: "180"
+  DRY_RUN: "false"
+---
+# ─────────────────────────────────────────────────────────
+# Deployment : 1 pod qui tourne en continu
+# ─────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auto-remediator
+  namespace: logguardian
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auto-remediator
+  template:
+    metadata:
+      labels:
+        app: auto-remediator
+    spec:
+      serviceAccountName: auto-remediator
+      enableServiceLinks: false
+      containers:
+        - name: auto-remediator
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/auto-remediator:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: auto-remediator-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-apps
+  labels:
+    purpose: logguardian-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  namespace: demo-apps
+  labels:
+    app: web-frontend
+    tier: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-frontend
+  template:
+    metadata:
+      labels:
+        app: web-frontend
+        tier: frontend
+    spec:
+      containers:
+        - name: app
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              i=0
+              while true; do
+                i=$((i+1))
+                echo "INFO web-frontend: GET /api/users/$((RANDOM % 1000)) 200 OK 42ms"
+                sleep 2
+                echo "INFO web-frontend: GET /api/products/$((RANDOM % 500)) 200 OK 38ms"
+                sleep 2
+                echo "INFO web-frontend: POST /api/cart/add 201 CREATED 65ms"
+                sleep 2
+                if [ $((i % 15)) -eq 0 ]; then
+                  echo "WARN web-frontend: slow response 1230ms on /api/search"
+                fi
+              done
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-backend
+  namespace: demo-apps
+  labels:
+    app: api-backend
+    tier: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-backend
+  template:
+    metadata:
+      labels:
+        app: api-backend
+        tier: backend
+    spec:
+      containers:
+        - name: app
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              i=0
+              while true; do
+                i=$((i+1))
+                echo "INFO api-backend: processing order_id=$((RANDOM % 9999)) status=confirmed"
+                sleep 3
+                echo "INFO api-backend: payment gateway response OK txid=tx_$((RANDOM % 99999))"
+                sleep 3
+                echo "INFO api-backend: cache hit ratio 0.87 on user_sessions"
+                sleep 3
+                if [ $((i % 20)) -eq 0 ]; then
+                  echo "WARN api-backend: retry attempt 2/3 for order_id=$((RANDOM % 999))"
+                fi
+              done
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-worker
+  namespace: demo-apps
+  labels:
+    app: db-worker
+    tier: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-worker
+  template:
+    metadata:
+      labels:
+        app: db-worker
+        tier: worker
+    spec:
+      containers:
+        - name: app
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                echo "INFO db-worker: query executed in 12ms - SELECT count(*) FROM orders"
+                sleep 4
+                echo "INFO db-worker: connection pool status active=8 idle=12 max=20"
+                sleep 4
+                echo "INFO db-worker: backup job scheduled at $(date -u +%H:%M)"
+                sleep 6
+              done
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

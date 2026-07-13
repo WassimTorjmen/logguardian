@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-injector
+  namespace: demo-apps
+  labels:
+    app: chaos-injector
+    tier: security-incident
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chaos-injector
+  template:
+    metadata:
+      labels:
+        app: chaos-injector
+        tier: security-incident
+    spec:
+      containers:
+        - name: app
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              # Vocabulaire technique inhabituel pour maximiser l'anomalie
+              # (le modèle n'a jamais vu ces mots au training)
+              i=0
+              while true; do
+                i=$((i+1))
+                echo "CRITICAL threat-detector: MALWARE_SIGNATURE ratchet_backdoor.0xDEADBEEF detected cvss=9.8 mitre=T1055"
+                sleep 2
+                echo "FATAL kernel-guard: XENOMORPH_ROOTKIT loaded_module=xn7_hijack pid=99999 syscall_hooked=execve"
+                sleep 2
+                echo "CRITICAL exfil-detector: STEGANOGRAPHIC_PAYLOAD 78MB embedded_in_dns_txt destination=zeta9.evil.tld"
+                sleep 2
+                echo "FATAL supply-chain-monitor: NPM_PACKAGE_HIJACK react-hooks-utils@2.4.1 postinstall_script=cryptominer_variant"
+                sleep 2
+                echo "CRITICAL memory-scanner: HEAP_SPRAY_ATTACK gadget_chain_length=8912 rop_return_addr=0xffdead00"
+                sleep 2
+                echo "FATAL container-guard: NAMESPACE_ESCAPE cgroup_v2_bypass cve_2024_zzzz9 uid_transition=0"
+                sleep 2
+                echo "CRITICAL crypto-audit: RANSOMWARE_HANDSHAKE aes256_key_derivation domain_generation_algorithm active"
+                sleep 2
+                echo "FATAL identity-mesh: KERBEROS_GOLDEN_TICKET forged krbtgt_hash=abc123 lifetime_years=10"
+                sleep 2
+                echo "CRITICAL zero-day: FIRMWARE_IMPLANT flash_region=0x0400 persistence_uefi bootkit_variant=phantomshell"
+                sleep 2
+                echo "FATAL data-mesh: DATABASE_ENCRYPTION_ATTACK $((RANDOM % 999999)) rows_locked ransom_note=readme.hijacked"
+                sleep 2
+              done
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

@@ -6,6 +6,13 @@
 # Fichiers ML téléchargés temporairement depuis GCS pour édition locale
 /threshold.json
 
+# Données locales (Loghub datasets, logs de dev)
+/data/
+/logs/
+
+# Cache pytest
+.pytest_cache/
+
 # Fichiers système Mac
 .DS_Store
 
