@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ticket-sender-config
+  namespace: logguardian
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka.logguardian.svc.cluster.local:29092
+  KAFKA_SUPPORT_TOPIC: support-tickets
+  KAFKA_GROUP_ID: logguardian-support-ticket-sender
+  KAFKA_AUTO_OFFSET_RESET: earliest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ticket-sender
+  namespace: logguardian
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ticket-sender
+  template:
+    metadata:
+      labels:
+        app: ticket-sender
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: ticket-sender
+          image: europe-west1-docker.pkg.dev/logguardian-497218/logguardian/ticket-sender:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: ticket-sender-config
+            - secretRef:
+                name: monitoring-ui-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

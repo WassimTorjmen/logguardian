@@ -9,12 +9,12 @@ import json
 import logging
 import os
 import signal
-import smtplib
 import time
 from datetime import datetime, timezone
-from email.message import EmailMessage
 
 from confluent_kafka import Consumer, KafkaException
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,16 +28,14 @@ KAFKA_SUPPORT_TOPIC     = os.getenv("KAFKA_SUPPORT_TOPIC",    "support-tickets")
 KAFKA_GROUP_ID          = os.getenv("KAFKA_GROUP_ID",         "logguardian-support-ticket-sender")
 KAFKA_AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "earliest")
 
-# ── Configuration SMTP ─────────────────────────────────────────────────────
-SMTP_HOST       = os.getenv("SMTP_HOST",       "smtp.gmail.com")
-SMTP_PORT       = int(os.getenv("SMTP_PORT",   "587"))
-SMTP_USER       = os.getenv("SMTP_USER",       "")
-SMTP_PASSWORD   = os.getenv("SMTP_PASSWORD",   "")
-MAIL_TO         = os.getenv("MAIL_TO",         "")
-SUPPORT_MAIL_TO = os.getenv("SUPPORT_MAIL_TO", "").strip()
+# ── Configuration envoi (SendGrid API — HTTPS, non bloqué sortant sur GCP) ──
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SMTP_USER        = os.getenv("SMTP_USER", "")   # adresse expéditeur (vérifiée côté SendGrid)
+MAIL_TO          = os.getenv("MAIL_TO", "")
+SUPPORT_MAIL_TO  = os.getenv("SUPPORT_MAIL_TO", "").strip()
 
 # Délais de retry progressifs (secondes)
-_SMTP_RETRY_DELAYS = [5, 15, 30, 60]
+_SEND_RETRY_DELAYS = [5, 15, 30, 60]
 
 _running = True
 
@@ -67,9 +65,9 @@ def _ticket_id(ticket: dict) -> str:
 
 # ── Construction de l'email ────────────────────────────────────────────────
 
-def _build_ticket_email(ticket: dict) -> EmailMessage:
+def _build_ticket_body(ticket: dict) -> tuple[str, str]:
+    """Retourne (subject, body) pour le ticket."""
     tid       = _ticket_id(ticket)
-    recipient = _recipient()
     user_msg  = (ticket.get("user_message") or "").strip() or "Aucun commentaire fourni."
     sep       = "═" * 62
     fmt       = "%Y-%m-%d %H:%M:%S UTC"
@@ -121,40 +119,27 @@ def _build_ticket_email(ticket: dict) -> EmailMessage:
         f"Email généré le : {datetime.now(tz=timezone.utc).strftime(fmt)}",
     ]
 
-    email = EmailMessage()
-    email["Subject"] = f"[LogGuardian][Ticket {tid}] Analyse manuelle demandée"
-    email["From"]    = SMTP_USER
-    email["To"]      = recipient
-    email.set_content("\n".join(lines), charset="utf-8")
-    return email
+    subject = f"[LogGuardian][Ticket {tid}] Analyse manuelle demandée"
+    body    = "\n".join(lines)
+    return subject, body
 
 
-# ── SMTP ───────────────────────────────────────────────────────────────────
-
-def _smtp_connect() -> smtplib.SMTP:
-    server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-    server.ehlo()
-    server.starttls()
-    server.ehlo()
-    server.login(SMTP_USER, SMTP_PASSWORD)
-    return server
-
+# ── SendGrid ───────────────────────────────────────────────────────────────
 
 def _send_ticket_email(ticket: dict) -> None:
     recipient = _recipient()
-    if not SMTP_USER or not SMTP_PASSWORD or not recipient:
-        log.warning("SMTP config incomplète — ticket ignoré.")
+    if not SENDGRID_API_KEY or not SMTP_USER or not recipient:
+        log.warning("Configuration SendGrid incomplète — ticket ignoré.")
         return
 
-    email  = _build_ticket_email(ticket)
-    server = _smtp_connect()
-    try:
-        server.send_message(email)
-    finally:
-        try:
-            server.quit()
-        except Exception:
-            pass
+    subject, body = _build_ticket_body(ticket)
+    message = Mail(
+        from_email=SMTP_USER,
+        to_emails=recipient,
+        subject=subject,
+        plain_text_content=body,
+    )
+    SendGridAPIClient(SENDGRID_API_KEY).send(message)
 
     tid = _ticket_id(ticket)
     log.info("Support ticket sent | ticket_id=%s | recipient=%s", tid, recipient)
@@ -165,7 +150,7 @@ def _send_ticket_email(ticket: dict) -> None:
 def _process_with_retry(consumer: Consumer, ticket: dict, msg) -> None:
     """Envoie le ticket. Retry progressif. Commit l'offset après succès."""
     tid          = _ticket_id(ticket)
-    retry_delays = list(_SMTP_RETRY_DELAYS)
+    retry_delays = list(_SEND_RETRY_DELAYS)
 
     while True:
         try:
@@ -175,14 +160,14 @@ def _process_with_retry(consumer: Consumer, ticket: dict, msg) -> None:
         except Exception as exc:
             if not retry_delays:
                 log.error(
-                    "SMTP echec définitif | ticket_id=%s | error=%s — offset non validé",
+                    "Envoi echec définitif | ticket_id=%s | error=%s — offset non validé",
                     tid, exc,
                 )
                 # Pas de commit : le ticket sera rejoué au prochain démarrage
                 return
             delay = retry_delays.pop(0)
             log.error(
-                "SMTP error | ticket_id=%s | retry_in=%ds | error=%s",
+                "SendGrid error | ticket_id=%s | retry_in=%ds | error=%s",
                 tid, delay, exc,
             )
             time.sleep(delay)
@@ -268,3 +253,55 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ROLLBACK — ancienne version SMTP Gmail (désactivée, inerte)
+#
+# Cassée en prod : GCP bloque les ports SMTP sortants (25/465/587) sur les
+# nœuds GKE. Conservée ici pour rollback rapide en cas de souci SendGrid.
+# Pour revenir en arrière : remettre `import smtplib` et
+# `from email.message import EmailMessage` en haut du fichier, remettre
+# SMTP_HOST/SMTP_PORT/SMTP_PASSWORD dans la ConfigMap, et coller ce bloc
+# à la place de _build_ticket_body/_send_ticket_email.
+# ═══════════════════════════════════════════════════════════════════════════
+_DISABLED_GMAIL_SMTP_VERSION = r'''
+SMTP_HOST     = os.getenv("SMTP_HOST",     "smtp.gmail.com")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+
+def _build_ticket_email(ticket):
+    tid       = _ticket_id(ticket)
+    recipient = _recipient()
+    email = EmailMessage()
+    email["Subject"] = f"[LogGuardian][Ticket {tid}] Analyse manuelle demandee"
+    email["From"]    = SMTP_USER
+    email["To"]      = recipient
+    email.set_content(f"Ticket {tid} - voir dashboard.", charset="utf-8")
+    return email
+
+def _smtp_connect():
+    server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    server.login(SMTP_USER, SMTP_PASSWORD)
+    return server
+
+def _send_ticket_email(ticket):
+    recipient = _recipient()
+    if not SMTP_USER or not SMTP_PASSWORD or not recipient:
+        log.warning("SMTP config incomplete - ticket ignore.")
+        return
+    email  = _build_ticket_email(ticket)
+    server = _smtp_connect()
+    try:
+        server.send_message(email)
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    tid = _ticket_id(ticket)
+    log.info("Support ticket sent | ticket_id=%s | recipient=%s", tid, recipient)
+'''
