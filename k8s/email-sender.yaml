@@ -8,8 +8,8 @@ data:
   KAFKA_TOPIC: logs-anomalies-ml
   SMTP_HOST: smtp.gmail.com
   SMTP_PORT: "587"
-  ALERT_BATCH_SECONDS: "900"
-  ALERT_BATCH_MAX_SIZE: "100"
+  ALERT_BATCH_SECONDS: "3600"
+  ALERT_BATCH_MAX_SIZE: "300"
 ---
 apiVersion: apps/v1
 kind: Deployment
