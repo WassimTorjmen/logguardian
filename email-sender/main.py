@@ -8,12 +8,12 @@ import json
 import logging
 import os
 import signal
-import smtplib
 import time
 from datetime import datetime, timezone
-from email.message import EmailMessage
 
 from confluent_kafka import Consumer, KafkaException
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,15 +31,15 @@ KAFKA_AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
 ALERT_BATCH_SECONDS  = int(os.getenv("ALERT_BATCH_SECONDS",  "900"))
 ALERT_BATCH_MAX_SIZE = int(os.getenv("ALERT_BATCH_MAX_SIZE", "100"))
 
-# ── Configuration SMTP ─────────────────────────────────────────────────────
-SMTP_HOST     = os.getenv("SMTP_HOST",     "smtp.gmail.com")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER",     "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-MAIL_TO       = os.getenv("MAIL_TO",       "")
+# ── Configuration envoi (SendGrid API — HTTPS, non bloqué sortant sur GCP) ──
+# GCP bloque les ports SMTP sortants (25/465/587) sur les nœuds GKE : l'envoi
+# passe donc par l'API HTTPS de SendGrid plutôt que par smtplib direct.
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SMTP_USER        = os.getenv("SMTP_USER", "")   # réutilisé comme adresse expéditeur (vérifiée côté SendGrid)
+MAIL_TO          = os.getenv("MAIL_TO",   "")
 
 # Délais de retry progressifs (secondes)
-_SMTP_RETRY_DELAYS = [5, 15, 30, 60]
+_SEND_RETRY_DELAYS = [5, 15, 30, 60]
 
 _running = True
 
@@ -68,11 +68,12 @@ def _extract_message(event: dict) -> str:
 
 # ── Construction de l'email ────────────────────────────────────────────────
 
-def _build_digest_email(
+def _build_digest_body(
     batch: list[dict],
     period_start: datetime,
     period_end: datetime,
-) -> EmailMessage:
+) -> tuple[str, str]:
+    """Retourne (subject, body) pour le digest."""
     n       = len(batch)
     sources = sorted({e.get("source", "unknown") for e in batch})
     hosts   = sorted({e.get("host",   "unknown") for e in batch})
@@ -118,43 +119,30 @@ def _build_digest_email(
         f"Email généré le : {generated_at}",
     ]
 
-    email = EmailMessage()
-    email["Subject"] = f"[LogGuardian] Récapitulatif de {n} anomalie(s)"
-    email["From"]    = SMTP_USER
-    email["To"]      = MAIL_TO
-    email.set_content("\n".join(lines), charset="utf-8")
-    return email
+    subject = f"[LogGuardian] Récapitulatif de {n} anomalie(s)"
+    body    = "\n".join(lines)
+    return subject, body
 
 
-# ── SMTP ───────────────────────────────────────────────────────────────────
-
-def _smtp_connect() -> smtplib.SMTP:
-    server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-    server.ehlo()
-    server.starttls()
-    server.ehlo()
-    server.login(SMTP_USER, SMTP_PASSWORD)
-    return server
-
+# ── SendGrid ───────────────────────────────────────────────────────────────
 
 def _send_digest(
     batch: list[dict],
     period_start: datetime,
     period_end: datetime,
 ) -> None:
-    if not SMTP_USER or not SMTP_PASSWORD or not MAIL_TO:
-        log.warning("SMTP config incomplète — envoi du digest ignoré.")
+    if not SENDGRID_API_KEY or not SMTP_USER or not MAIL_TO:
+        log.warning("Configuration SendGrid incomplète — envoi du digest ignoré.")
         return
 
-    email  = _build_digest_email(batch, period_start, period_end)
-    server = _smtp_connect()
-    try:
-        server.send_message(email)
-    finally:
-        try:
-            server.quit()
-        except Exception:
-            pass
+    subject, body = _build_digest_body(batch, period_start, period_end)
+    message = Mail(
+        from_email=SMTP_USER,
+        to_emails=MAIL_TO,
+        subject=subject,
+        plain_text_content=body,
+    )
+    SendGridAPIClient(SENDGRID_API_KEY).send(message)
 
     log.info("Alert digest sent | anomalies=%d | to=%s", len(batch), MAIL_TO)
 
@@ -168,7 +156,7 @@ def _flush_with_retry(
     period_end: datetime,
 ) -> None:
     """Envoie le digest. Retry progressif. Commit tous les offsets après succès."""
-    retry_delays = list(_SMTP_RETRY_DELAYS)
+    retry_delays = list(_SEND_RETRY_DELAYS)
 
     while True:
         try:
@@ -179,13 +167,13 @@ def _flush_with_retry(
         except Exception as exc:
             if not retry_delays:
                 log.error(
-                    "SMTP echec définitif — batch de %d anomalie(s) non envoyé : %s",
+                    "Envoi echec définitif — batch de %d anomalie(s) non envoyé : %s",
                     len(batch), exc,
                 )
                 # Pas de commit : le batch sera rejoué au prochain démarrage
                 return
             delay = retry_delays.pop(0)
-            log.error("SMTP error | retry_in=%ds | error=%s", delay, exc)
+            log.error("SendGrid error | retry_in=%ds | error=%s", delay, exc)
             time.sleep(delay)
 
 
@@ -293,3 +281,65 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ROLLBACK — ancienne version SMTP Gmail (désactivée, inerte)
+#
+# Cassée en prod : GCP bloque les ports SMTP sortants (25/465/587) sur les
+# nœuds GKE, d'où l'échec systématique (535 Bad Credentials n'était qu'un
+# symptôme secondaire — même avec des identifiants valides, la connexion au
+# port 587 est filtrée côté réseau GCP).
+#
+# Pour revenir en arrière en urgence : supprimer le bloc SendGrid ci-dessus
+# (imports, SENDGRID_API_KEY, _build_digest_body/_send_digest) et coller
+# le code ci-dessous à sa place. Nécessite aussi de remettre
+# `import smtplib` et `from email.message import EmailMessage` en haut du
+# fichier, et SMTP_HOST/SMTP_PORT/SMTP_PASSWORD dans la ConfigMap.
+# ═══════════════════════════════════════════════════════════════════════════
+_DISABLED_GMAIL_SMTP_VERSION = r'''
+SMTP_HOST     = os.getenv("SMTP_HOST",     "smtp.gmail.com")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER",     "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+MAIL_TO       = os.getenv("MAIL_TO",       "")
+
+def _build_digest_email(batch, period_start, period_end):
+    n       = len(batch)
+    sources = sorted({e.get("source", "unknown") for e in batch})
+    hosts   = sorted({e.get("host",   "unknown") for e in batch})
+    fmt        = "%Y-%m-%d %H:%M:%S UTC"
+    period_str = f"{period_start.strftime(fmt)} -> {period_end.strftime(fmt)}"
+    lines = ["Bonjour,", "", f"LogGuardian a detecte {n} anomalie(s) dans la periode :", f"  {period_str}"]
+    for i, event in enumerate(batch, 1):
+        lines += [f"[{i}/{n}] {event.get('source')} / {event.get('host')} - {event.get('anomaly_score')}"]
+    email = EmailMessage()
+    email["Subject"] = f"[LogGuardian] Recapitulatif de {n} anomalie(s)"
+    email["From"]    = SMTP_USER
+    email["To"]      = MAIL_TO
+    email.set_content("\n".join(lines), charset="utf-8")
+    return email
+
+def _smtp_connect():
+    server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    server.login(SMTP_USER, SMTP_PASSWORD)
+    return server
+
+def _send_digest(batch, period_start, period_end):
+    if not SMTP_USER or not SMTP_PASSWORD or not MAIL_TO:
+        log.warning("SMTP config incomplete - envoi du digest ignore.")
+        return
+    email  = _build_digest_email(batch, period_start, period_end)
+    server = _smtp_connect()
+    try:
+        server.send_message(email)
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    log.info("Alert digest sent | anomalies=%d | to=%s", len(batch), MAIL_TO)
+'''
