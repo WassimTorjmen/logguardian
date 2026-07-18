@@ -15,7 +15,11 @@ metadata:
   name: ticket-sender
   namespace: logguardian
 spec:
-  replicas: 1
+  # Volontairement à 0 par défaut : évite qu'un `kubectl apply -f k8s/`
+  # pendant la préparation de la démo ne réactive silencieusement le service.
+  # Activer manuellement via `kubectl scale --replicas=1` au moment voulu
+  # (voir demo-scenario/COMMANDES.md).
+  replicas: 0
   selector:
     matchLabels:
       app: ticket-sender

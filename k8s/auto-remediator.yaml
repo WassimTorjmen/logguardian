@@ -64,7 +64,13 @@ metadata:
   name: auto-remediator
   namespace: logguardian
 spec:
-  replicas: 1
+  # Volontairement à 0 par défaut : critique à vérifier avant la démo — s'il
+  # redémarre à 1 automatiquement pendant la préparation (via un `kubectl apply`
+  # non contrôlé), il peut commencer à supprimer des pods demo-apps avant qu'on
+  # soit prêt à montrer la scène de rémédiation.
+  # Activer manuellement via `kubectl scale --replicas=1` au moment voulu
+  # (voir demo-scenario/COMMANDES.md).
+  replicas: 0
   selector:
     matchLabels:
       app: auto-remediator
