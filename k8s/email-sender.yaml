@@ -8,7 +8,7 @@ data:
   KAFKA_TOPIC: logs-anomalies-ml
   SMTP_HOST: smtp.gmail.com
   SMTP_PORT: "587"
-  ALERT_BATCH_SECONDS: "3600"
+  ALERT_BATCH_SECONDS: "900"
   ALERT_BATCH_MAX_SIZE: "300"
 ---
 apiVersion: apps/v1
@@ -17,7 +17,12 @@ metadata:
   name: email-sender
   namespace: logguardian
 spec:
-  replicas: 1
+  # Volontairement à 0 par défaut : tant que le seuil ML de démo (0.3) est actif,
+  # le volume d'anomalies remplit un lot de 300 en quelques minutes — laisser
+  # tourner en continu viderait le quota SendGrid (100/jour) très vite.
+  # Activer manuellement via `kubectl scale --replicas=1` au moment voulu,
+  # puis repasser à 0 juste après confirmation d'envoi (voir demo-scenario/COMMANDES.md).
+  replicas: 0
   selector:
     matchLabels:
       app: email-sender
